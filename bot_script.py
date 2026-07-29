@@ -19,9 +19,12 @@ Safety model (read before running):
 - Credentials come from a local .env file next to this script — never hardcode
   a token in code.
 - Deriv's auth model is OAuth2 + a per-connection OTP-issued websocket URL, not
-  a static token. Run `python3 deriv_login.py` once first (interactive browser
+  a static token. Visit server.py's /login route once (interactive browser
   login); it saves tokens to deriv_tokens.json, which this script refreshes
-  automatically afterward. DRY_RUN uses the 'demo' account, LIVE uses 'real'.
+  automatically afterward. ACCOUNT ("demo"/"real") picks which account to
+  trade against, independently of LIVE_CONFIRM (which picks quote-only vs.
+  actually buying) — e.g. account=demo + live_confirm=yes runs the full
+  buy/settle loop with play money.
 - Defaults to DRY_RUN: fetches one live proposal (real payout quote) but does
   NOT buy, so you can verify connectivity, symbol, barrier, and logging
   before any money moves. Set LIVE_CONFIRM=yes in .env to place real trades.
@@ -135,14 +138,15 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# OAuth2 token management (see deriv_login.py for the initial interactive login)
+# OAuth2 token management (see server.py's /login route for the initial interactive login)
 # ---------------------------------------------------------------------------
 
 
 def load_tokens() -> dict:
     if not TOKENS_FILE.exists():
         raise SystemExit(
-            "No deriv_tokens.json found. Run `python3 deriv_login.py` once to log in."
+            "No deriv_tokens.json found. Visit /login?app_id=...&api_key=... once to log in "
+            "(see server.py's module docstring)."
         )
     return json.loads(TOKENS_FILE.read_text())
 
@@ -165,7 +169,7 @@ def refresh_access_token(app_id: str, refresh_token: str) -> dict:
     if not resp.ok:
         raise SystemExit(
             f"Refreshing the Deriv OAuth token failed ({resp.status_code}): {resp.text}\n"
-            "Run `python3 deriv_login.py` again to re-authorize."
+            "Visit /login?app_id=...&api_key=... again to re-authorize."
         )
     return resp.json()
 
@@ -187,7 +191,7 @@ def pick_account(tokens: dict, account_type: str) -> str:
             return acc["account_id"]
     raise SystemExit(
         f"No active '{account_type}' account found in deriv_tokens.json. "
-        "Open one on Deriv, then run `python3 deriv_login.py` again."
+        "Open one on Deriv, then visit /login?app_id=...&api_key=... again."
     )
 
 
