@@ -48,7 +48,9 @@ from websockets.legacy.client import WebSocketClientProtocol, connect
 from websockets.exceptions import ConnectionClosed
 
 TOKENS_FILE = Path(__file__).with_name("deriv_tokens.json")
+OAUTH_AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 OAUTH_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
+ACCOUNTS_URL = "https://api.derivws.com/trading/v1/options/accounts"
 OTP_URL_TEMPLATE = "https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp"
 
 # ---------------------------------------------------------------------------
