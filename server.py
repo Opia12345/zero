@@ -35,7 +35,9 @@ local testing, not for a deployed app that can place real trades.
 """
 
 import base64
+import csv
 import hashlib
+import json
 import os
 import secrets
 import time
@@ -48,6 +50,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 import bot_script as bot
+from dashboard import render_dashboard
 
 app = FastAPI(title="Deriv Over/Under bot")
 
@@ -178,6 +181,7 @@ async def run(
     app_id: Optional[str] = Query(default=None),
     stake: Optional[float] = Query(default=None),
     live_confirm: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None, description="'demo' or 'real' — which Deriv account to trade against"),
     api_key: Optional[str] = Query(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
@@ -190,6 +194,8 @@ async def run(
         overrides["STAKE"] = str(stake)
     if live_confirm is not None:
         overrides["LIVE_CONFIRM"] = live_confirm
+    if account is not None:
+        overrides["ACCOUNT"] = account
 
     try:
         cfg = bot.Config.load(overrides)
@@ -207,3 +213,29 @@ async def run(
         logger.close()
 
     return JSONResponse(summary)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(
+    api_key: Optional[str] = Query(default=None),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    _check_api_key(x_api_key, api_key)
+
+    file_env = bot.load_env_file(Path(__file__).with_name(".env"))
+    log_name = os.environ.get("LOG_FILE") or file_env.get("LOG_FILE") or "trade_log.csv"
+    log_path = Path(__file__).with_name(log_name)
+
+    rows: list = []
+    if log_path.exists():
+        with log_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+    accounts: list = []
+    if bot.TOKENS_FILE.exists():
+        try:
+            accounts = json.loads(bot.TOKENS_FILE.read_text()).get("accounts", [])
+        except json.JSONDecodeError:
+            accounts = []
+
+    return HTMLResponse(render_dashboard(rows, accounts))

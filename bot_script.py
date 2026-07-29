@@ -73,6 +73,7 @@ def load_env_file(path: Path) -> dict:
 @dataclass
 class Config:
     app_id: str
+    account: str  # "demo" or "real" — which Deriv account to trade against
     symbol: str
     direction: str  # "OVER" or "UNDER"
     barrier: str  # "0".."9"
@@ -82,7 +83,7 @@ class Config:
     duration_unit: str
     max_daily_loss: float
     max_attempts: int
-    live_confirm: bool
+    live_confirm: bool  # whether to actually buy contracts, vs. quote-only
     log_file: Path
 
     @classmethod
@@ -100,6 +101,10 @@ class Config:
 
         app_id = get("DERIV_APP_ID", required=True)
 
+        account = get("ACCOUNT", "demo").lower()
+        if account not in ("demo", "real"):
+            raise SystemExit("ACCOUNT must be 'demo' or 'real'")
+
         direction = get("DIRECTION", "OVER").upper()
         if direction not in ("OVER", "UNDER"):
             raise SystemExit("DIRECTION must be OVER or UNDER")
@@ -114,6 +119,7 @@ class Config:
 
         return cls(
             app_id=app_id,
+            account=account,
             symbol=get("SYMBOL", "R_100"),
             direction=direction,
             barrier=barrier,
@@ -377,6 +383,7 @@ class TradeLogger:
     FIELDS = [
         "timestamp",
         "mode",
+        "account",
         "symbol",
         "contract_type",
         "barrier",
@@ -389,11 +396,29 @@ class TradeLogger:
 
     def __init__(self, path: Path):
         is_new = not path.exists()
+        if not is_new:
+            self._migrate_if_needed(path)
         self._file = path.open("a", newline="")
         self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
         if is_new:
             self._writer.writeheader()
             self._file.flush()
+
+    @classmethod
+    def _migrate_if_needed(cls, path: Path) -> None:
+        """Rewrite the file if its header doesn't match FIELDS (e.g. after an
+        older deploy logged rows before a column was added) — appending as-is
+        would silently misalign every column after the change."""
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames == cls.FIELDS:
+                return
+            rows = list(reader)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cls.FIELDS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in cls.FIELDS})
 
     def log(self, **kwargs):
         self._writer.writerow({f: kwargs.get(f, "") for f in self.FIELDS})
@@ -410,14 +435,17 @@ class TradeLogger:
 
 async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeLogger) -> dict:
     """Runs exactly one session: DRY_RUN checks one quote; LIVE trades until
-    a win, MAX_ATTEMPTS, or MAX_DAILY_LOSS — whichever comes first. Timing is
-    the caller's responsibility (e.g. an external cron scheduler hitting the
-    API endpoint) — this function does not wait for a daily window itself.
-    Returns a JSON-serializable summary of what happened."""
+    a win, MAX_ATTEMPTS, or MAX_DAILY_LOSS — whichever comes first. `mode`
+    controls quote-only vs. actually-buying; `cfg.account` ("demo"/"real")
+    controls which account it runs against — the two are independent, so
+    LIVE + account=demo runs the full buy/settle loop with play money. Timing
+    is the caller's responsibility (e.g. an external cron scheduler hitting
+    the API endpoint) — this function does not wait for a daily window
+    itself. Returns a JSON-serializable summary of what happened."""
     tokens = ensure_access_token(load_tokens())
-    account_id = pick_account(tokens, "real" if mode == "LIVE" else "demo")
+    account_id = pick_account(tokens, cfg.account)
     client = DerivClient(cfg.app_id, tokens["access_token"], account_id)
-    summary: dict = {"mode": mode, "symbol": cfg.symbol, "contract_type": contract_type}
+    summary: dict = {"mode": mode, "account": cfg.account, "symbol": cfg.symbol, "contract_type": contract_type}
     try:
         await client.connect()
         bal = await client.get_balance()
@@ -439,8 +467,8 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                     f"payout={payout:.2f} — quote only, no purchase made"
                 )
                 logger.log(
-                    timestamp=ts, mode=mode, symbol=cfg.symbol, contract_type=contract_type,
-                    barrier=cfg.barrier, stake=ask_price, payout=payout,
+                    timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                    contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
                 )
                 summary.update(status="quoted", ask_price=ask_price, payout=payout)
             except DerivApiError as e:
@@ -485,9 +513,9 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 balance_after = ""
 
             logger.log(
-                timestamp=ts, mode=mode, symbol=cfg.symbol, contract_type=contract_type,
-                barrier=cfg.barrier, stake=ask_price, payout=payout, profit=profit,
-                balance_after=balance_after, contract_id=bought.get("contract_id"),
+                timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
+                profit=profit, balance_after=balance_after, contract_id=bought.get("contract_id"),
             )
 
             result = "WON" if profit > 0 else "LOST"
@@ -523,7 +551,7 @@ async def run():
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
     contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
     logger = TradeLogger(cfg.log_file)
-    print(f"=== Deriv Over/Under bot | {mode} | stake={cfg.stake} app_id={cfg.app_id} ===")
+    print(f"=== Deriv Over/Under bot | {mode} | account={cfg.account} stake={cfg.stake} app_id={cfg.app_id} ===")
     try:
         summary = await run_session(cfg, contract_type, mode, logger)
         print(summary)
