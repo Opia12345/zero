@@ -33,6 +33,21 @@ Safety model (read before running):
   they bound how much a bad day can cost.
 - No martingale/progressive staking: every trade uses the same flat STAKE
   from .env, and STAKE must be > 0.
+
+Entry timing (optional):
+- By default a session proposes/buys immediately when called. Set
+  WAIT_FOR_DIGIT (0-9) in .env to instead subscribe to live ticks and hold
+  off each entry until a tick's last digit matches — the buy fires right
+  after that tick, so with the default DURATION=1 tick it settles on the
+  digit immediately following the one that triggered entry. This is applied
+  before every attempt in a session, not just the first.
+- WAIT_FOR_DIGIT_TIMEOUT (default 180s) bounds how long one wait can run
+  before it's treated as a proposal error and retried.
+- Caution: this can make a single /run call block for a while (each entry
+  may need to wait out several ticks). If triggered by an external cron
+  service over HTTP, its request may time out before the session finishes
+  even though the session keeps running server-side — check trade_log.csv /
+  Telegram notifications rather than relying on the HTTP response.
 """
 
 import asyncio
@@ -90,6 +105,8 @@ class Config:
     log_file: Path
     telegram_bot_token: str
     telegram_chat_id: str
+    wait_for_digit: str  # "" disables; "0".."9" waits for that digit to tick before each entry
+    wait_for_digit_timeout: float
 
     @classmethod
     def load(cls, overrides: dict | None = None) -> "Config":
@@ -118,6 +135,10 @@ class Config:
         if barrier not in [str(d) for d in range(10)]:
             raise SystemExit("BARRIER must be a single digit 0-9")
 
+        wait_for_digit = get("WAIT_FOR_DIGIT", "")
+        if wait_for_digit and wait_for_digit not in [str(d) for d in range(10)]:
+            raise SystemExit("WAIT_FOR_DIGIT must be empty (disabled) or a single digit 0-9")
+
         stake = float(get("STAKE", "1.0"))
         if stake <= 0:
             raise SystemExit("STAKE must be greater than 0")
@@ -138,6 +159,8 @@ class Config:
             log_file=Path(get("LOG_FILE", "trade_log.csv")),
             telegram_bot_token=get("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=get("TELEGRAM_CHAT_ID", ""),
+            wait_for_digit=wait_for_digit,
+            wait_for_digit_timeout=float(get("WAIT_FOR_DIGIT_TIMEOUT", "180")),
         )
 
 
@@ -208,6 +231,12 @@ class DerivApiError(Exception):
     pass
 
 
+class EntryDigitTimeout(DerivApiError):
+    """Raised when wait_for_digit doesn't see the target digit in time — a
+    normal outcome (not a network/API fault), meant to end the session
+    quietly rather than be retried like a proposal error."""
+
+
 class DerivClient:
     def __init__(self, app_id: str, access_token: str, account_id: str):
         self.app_id = app_id
@@ -276,6 +305,51 @@ class DerivClient:
     async def get_balance(self) -> dict:
         msg = await self._request({"balance": 1})
         return msg["balance"]
+
+    async def get_pip_size(self, symbol: str) -> int:
+        """Decimal places Deriv quotes `symbol` at — needed to read the same
+        'last digit' that digit contracts settle on, not a raw float digit."""
+        msg = await self._request({"active_symbols": "brief", "product_type": "basic"})
+        for s in msg.get("active_symbols", []):
+            if s.get("symbol") == symbol:
+                pip = str(s["pip"])
+                return len(pip.split(".", 1)[1]) if "." in pip else 0
+        raise DerivApiError(f"Symbol {symbol} not found in active_symbols")
+
+    async def wait_for_digit(self, symbol: str, digit: int, pip_size: int, timeout: float) -> dict:
+        """Blocks until a live tick's last digit == `digit`, then returns that
+        tick. Used to time entries so a trade only fires right after the
+        chosen digit appears, rather than on whatever tick happens to be
+        current when the session starts."""
+        assert self.ws is not None, "call connect() first"
+        req_id = next(self._req_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        self._sub_queues[req_id] = queue
+        await self.ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": req_id}))
+        subscription_id = None
+        try:
+            deadline = asyncio.get_running_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise EntryDigitTimeout(f"no digit {digit} seen on {symbol} within {timeout:.0f}s")
+                msg = await asyncio.wait_for(queue.get(), timeout=remaining)
+                if "error" in msg:
+                    raise DerivApiError(msg["error"].get("message", "Unknown API error"))
+                subscription_id = msg.get("subscription", {}).get("id", subscription_id)
+                tick = msg.get("tick")
+                if not tick:
+                    continue
+                last_digit = int(f"{float(tick['quote']):.{pip_size}f}"[-1])
+                if last_digit == digit:
+                    return tick
+        finally:
+            self._sub_queues.pop(req_id, None)
+            if subscription_id:
+                try:
+                    await self._request({"forget": subscription_id})
+                except DerivApiError:
+                    pass
 
     async def get_proposal(
         self,
@@ -487,8 +561,24 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
         summary["balance"] = bal["balance"]
         print(f"Connected to {bal['loginid']} | balance: {bal['balance']} {bal['currency']}")
 
+        pip_size = await client.get_pip_size(cfg.symbol) if cfg.wait_for_digit else None
+
+        async def wait_for_entry_digit() -> int | None:
+            """Returns the trigger tick's epoch (for later verification against
+            the contract's actual entry/exit ticks), or None if disabled."""
+            if not cfg.wait_for_digit:
+                return None
+            assert pip_size is not None
+            print(f"Watching {cfg.symbol} for digit {cfg.wait_for_digit}...")
+            tick = await client.wait_for_digit(
+                cfg.symbol, int(cfg.wait_for_digit), pip_size, cfg.wait_for_digit_timeout
+            )
+            print(f"Saw digit {cfg.wait_for_digit} (quote={tick['quote']}) — entering trade now")
+            return int(tick["epoch"])
+
         if mode == "DRY_RUN":
             try:
+                await wait_for_entry_digit()
                 proposal = await client.get_proposal(
                     contract_type, cfg.barrier, cfg.stake, cfg.duration,
                     cfg.duration_unit, cfg.symbol, cfg.currency,
@@ -511,6 +601,17 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
 
         risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts)
         while risk.can_trade():
+            try:
+                trigger_epoch = await wait_for_entry_digit()
+            except EntryDigitTimeout as e:
+                print(f"{e} — closing session without a trade this run")
+                risk.stop_reason = str(e)
+                break
+            except DerivApiError as e:
+                print(f"Digit-watch error: {e}")
+                await asyncio.sleep(2)
+                continue
+
             try:
                 proposal = await client.get_proposal(
                     contract_type, cfg.barrier, cfg.stake, cfg.duration,
@@ -536,6 +637,15 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 print(f"Trade error: {e}")
                 await asyncio.sleep(2)
                 continue
+
+            if trigger_epoch is not None:
+                entry_epoch = settled.get("entry_tick_time")
+                exit_epoch = settled.get("exit_tick_time")
+                if entry_epoch is not None and exit_epoch is not None:
+                    print(
+                        f"  entry tick landed {entry_epoch - trigger_epoch}s after the trigger digit "
+                        f"{cfg.wait_for_digit} | outcome tick landed {exit_epoch - entry_epoch}s after entry"
+                    )
 
             profit = float(settled.get("profit", 0))
             risk.record(profit)
