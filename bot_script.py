@@ -88,6 +88,8 @@ class Config:
     max_attempts: int
     live_confirm: bool  # whether to actually buy contracts, vs. quote-only
     log_file: Path
+    telegram_bot_token: str
+    telegram_chat_id: str
 
     @classmethod
     def load(cls, overrides: dict | None = None) -> "Config":
@@ -134,6 +136,8 @@ class Config:
             max_attempts=int(get("MAX_ATTEMPTS", "8")),
             live_confirm=get("LIVE_CONFIRM", "no").lower() == "yes",
             log_file=Path(get("LOG_FILE", "trade_log.csv")),
+            telegram_bot_token=get("TELEGRAM_BOT_TOKEN", ""),
+            telegram_chat_id=get("TELEGRAM_CHAT_ID", ""),
         )
 
 
@@ -379,6 +383,28 @@ class RiskManager:
 
 
 # ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+
+
+def send_telegram_message(cfg: Config, text: str) -> None:
+    """Best-effort notification — a Telegram outage must never take down a
+    trading session, so failures are logged and swallowed, not raised."""
+    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+        return
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+            json={"chat_id": cfg.telegram_chat_id, "text": text},
+            timeout=10,
+        )
+        if not resp.ok:
+            print(f"Telegram notify failed ({resp.status_code}): {resp.text}")
+    except requests.RequestException as e:
+        print(f"Telegram notify failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Trade logging
 # ---------------------------------------------------------------------------
 
@@ -527,15 +553,29 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 f"  -> {result} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
                 f"| attempts={risk.trades_done}/{cfg.max_attempts}"
             )
+            send_telegram_message(
+                cfg,
+                f"{result} {profit:+.2f} {cfg.currency} | {cfg.account} {cfg.symbol} "
+                f"{contract_type} barrier={cfg.barrier}\n"
+                f"daily_pnl={risk.daily_pnl:+.2f} | attempt {risk.trades_done}/{cfg.max_attempts}",
+            )
 
             await asyncio.sleep(1)
 
         if risk.won:
             print(f"Session done: WON on attempt {risk.trades_done} | net daily_pnl={risk.daily_pnl:+.2f}")
+            send_telegram_message(
+                cfg,
+                f"Session done: WON on attempt {risk.trades_done} | net daily_pnl={risk.daily_pnl:+.2f}",
+            )
         else:
             print(
                 f"Session done WITHOUT a win ({risk.stop_reason}) | "
                 f"net daily_pnl={risk.daily_pnl:+.2f} — today is a net loss despite the cap"
+            )
+            send_telegram_message(
+                cfg,
+                f"Session done WITHOUT a win ({risk.stop_reason}) | net daily_pnl={risk.daily_pnl:+.2f}",
             )
         summary.update(
             status="won" if risk.won else "stopped",
