@@ -387,6 +387,10 @@ class RiskManager:
 # ---------------------------------------------------------------------------
 
 
+def describe_contract(contract_type: str, barrier: str) -> str:
+    return f"{'over' if contract_type == 'DIGITOVER' else 'under'} {barrier}"
+
+
 def send_telegram_message(cfg: Config, text: str) -> None:
     """Best-effort notification — a Telegram outage must never take down a
     trading session, so failures are logged and swallowed, not raised."""
@@ -553,11 +557,17 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 f"  -> {result} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
                 f"| attempts={risk.trades_done}/{cfg.max_attempts}"
             )
+            trade_desc = describe_contract(contract_type, cfg.barrier)
+            if profit > 0:
+                headline = f"✅ Trade won: +{profit:.2f} {cfg.currency}"
+            else:
+                headline = f"❌ Trade lost: {profit:.2f} {cfg.currency}"
             send_telegram_message(
                 cfg,
-                f"{result} {profit:+.2f} {cfg.currency} | {cfg.account} {cfg.symbol} "
-                f"{contract_type} barrier={cfg.barrier}\n"
-                f"daily_pnl={risk.daily_pnl:+.2f} | attempt {risk.trades_done}/{cfg.max_attempts}",
+                f"{headline}\n"
+                f"{cfg.symbol}, {trade_desc}, {cfg.account} account\n"
+                f"📊 Attempt {risk.trades_done} of {cfg.max_attempts} today — running total: "
+                f"{risk.daily_pnl:+.2f} {cfg.currency}",
             )
 
             await asyncio.sleep(1)
@@ -566,7 +576,8 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
             print(f"Session done: WON on attempt {risk.trades_done} | net daily_pnl={risk.daily_pnl:+.2f}")
             send_telegram_message(
                 cfg,
-                f"Session done: WON on attempt {risk.trades_done} | net daily_pnl={risk.daily_pnl:+.2f}",
+                f"🏁 Session over — won on attempt {risk.trades_done} of {cfg.max_attempts}.\n"
+                f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
             )
         else:
             print(
@@ -575,7 +586,8 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
             )
             send_telegram_message(
                 cfg,
-                f"Session done WITHOUT a win ({risk.stop_reason}) | net daily_pnl={risk.daily_pnl:+.2f}",
+                f"🏁 Session over — no win today ({risk.stop_reason}).\n"
+                f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
             )
         summary.update(
             status="won" if risk.won else "stopped",
