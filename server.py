@@ -1,12 +1,27 @@
 """
-HTTP wrapper around bot_script.run_session(), meant to be triggered by an
-external cron scheduler (e.g. a Render Cron Job, or any scheduler that can
-make an HTTP call) hitting this service's deployed URL.
+FastAPI service for the Deriv digit-trigger bot.
 
-There is no scheduling inside this app — Render web services just keep
-running and answering requests, they don't run things "at 1am" by
-themselves. Something outside the app has to call POST /run at the time you
-want a session to fire.
+On boot, this starts bot_script.watch_and_trade() as a background task — it
+stays connected and watches ticks for as long as this process is up. Render
+free-tier web services spin down after ~15 min with no inbound HTTP traffic
+(which would kill that background task along with everything else), so keep
+something pinging GET /health every ~10 minutes (e.g. UptimeRobot or
+cron-job.org, configured on their site, not here) to keep the dyno awake.
+/health's response also reports whether the trading loop is running, so you
+can use the same ping to confirm the bot is actually alive, not just the
+web server.
+
+Note this only prevents *idle* spin-down. Render can still restart the
+process for other reasons (redeploys, crashes, platform maintenance) — if
+that happens mid-day, watch_and_trade rehydrates today's risk counters from
+trade_log.csv on the way back up, so MAX_DAILY_LOSS/MAX_ATTEMPTS still hold
+across the restart. It does NOT survive a redeploy wiping deriv_tokens.json
+(Render's free-tier disk is ephemeral) — you'd need to hit /login again
+after a redeploy, same as before.
+
+This also still exposes POST /run for a single blind OVER/UNDER session
+(bot_script.py's old --once/cron-triggered behavior), if you want that path
+instead of or alongside the always-on loop.
 
 Deploy on Render as a Web Service with:
     Start command: uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
@@ -34,6 +49,7 @@ API_SECRET isn't set, both /run and /login are unauthenticated — fine for
 local testing, not for a deployed app that can place real trades.
 """
 
+import asyncio
 import base64
 import csv
 import hashlib
@@ -42,6 +58,7 @@ import os
 import secrets
 import time
 import urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -52,7 +69,38 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import bot_script as bot
 from dashboard import render_dashboard
 
-app = FastAPI(title="Deriv Over/Under bot")
+# The always-on trading loop, started in `lifespan` below and cancelled on
+# shutdown. None if it never started (e.g. bad/missing .env config) — in
+# that case the rest of the app (like /login) still comes up so you can fix
+# it, and the loop needs a manual redeploy/restart once config is correct.
+_watch_task: Optional[asyncio.Task] = None
+_watch_logger: Optional["bot.TradeLogger"] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _watch_task, _watch_logger
+    try:
+        cfg = bot.Config.load()
+    except SystemExit as e:
+        print(f"Trading loop NOT started — fix .env and redeploy: {e}")
+        cfg = None
+    if cfg is not None:
+        _watch_logger = bot.TradeLogger(cfg.log_file)
+        _watch_task = asyncio.create_task(bot.watch_and_trade(cfg, _watch_logger))
+        print("Trading loop started on server boot.")
+    yield
+    if _watch_task:
+        _watch_task.cancel()
+        try:
+            await _watch_task
+        except asyncio.CancelledError:
+            pass
+    if _watch_logger:
+        _watch_logger.close()
+
+
+app = FastAPI(title="Deriv Over/Under bot", lifespan=lifespan)
 
 # state -> {app_id, code_verifier, redirect_uri}, cleared once consumed by
 # /oauth/callback. Fine as an in-memory dict: this app runs as a single
@@ -79,7 +127,21 @@ def _b64url(data: bytes) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Hit this every ~10 min from an external uptime pinger to keep a
+    Render free-tier dyno from spinning down. `trading` reports the
+    background loop's state: "running", "not started" (bad .env config —
+    check the server logs), or "stopped: <error>" (it crashed and won't
+    retry on its own — this shouldn't happen since watch_and_trade retries
+    internally, but would indicate a bug worth reporting)."""
+    trading = "not started"
+    if _watch_task is not None:
+        if not _watch_task.done():
+            trading = "running"
+        elif _watch_task.cancelled():
+            trading = "stopped: cancelled"
+        else:
+            trading = f"stopped: {_watch_task.exception()}"
+    return {"status": "ok", "trading": trading}
 
 
 @app.get("/login")

@@ -1,17 +1,28 @@
 """
-Deriv Over/Under digit-contract trading bot.
+Deriv digit-trigger trading bot.
 
-Runs exactly one session per invocation (CLI run, or one HTTP call to
-server.py's /run endpoint) — it does not schedule itself. An external cron
-caller (e.g. a Render Cron Job hitting the deployed URL) decides when to
-trigger it.
+Default mode (CLI: `python bot_script.py`) runs forever as a local, always-on
+process: it stays connected, watches every live tick on SYMBOL, and only
+places a trade the instant a tick's last digit equals DIGIT_TRIGGER (default
+"0"). The trade placed is DIGITDIFF barrier=DIGIT_TRIGGER — i.e. "bet the
+NEXT digit differs from the trigger digit". Just start it and leave the
+terminal open (or run it under `caffeinate -i python bot_script.py` on macOS
+so the trade loop keeps running even if the display sleeps); it keeps trading
+for as long as your machine is on and connected. Stop it with Ctrl+C.
 
-Session mechanic (by design, not an accident):
-- Each session takes flat-stake trades back to back until either (a) one of
-  them wins, or (b) MAX_ATTEMPTS is reached — whichever comes first.
-- IMPORTANT: this guarantees the session STOPS on the first win, not that it
-  is profitable. If it loses several attempts before winning, or never wins
-  within MAX_ATTEMPTS, that session's net result can still be negative — no
+`python bot_script.py --once` keeps the old behavior instead: a single blind
+OVER/UNDER session using DIRECTION/BARRIER from .env, then exit. That's what
+server.py's /run HTTP endpoint calls too (for an external cron/Render setup).
+
+Session/day mechanic (by design, not an accident):
+- Within a calendar day (UTC), the bot takes flat-stake trigger trades back
+  to back until either (a) one of them wins, or (b) MAX_ATTEMPTS is reached,
+  or (c) MAX_DAILY_LOSS is hit — whichever comes first. Once any of those
+  happens, it stops TRADING for the rest of that day but keeps watching
+  ticks, and automatically resumes trading right after the date rolls over.
+- IMPORTANT: stopping on the first win does not guarantee the day is
+  profitable. If it loses several attempts before winning, or never wins
+  within MAX_ATTEMPTS, that day's net result can still be negative — no
   staking scheme can change that against a random, house-edged game. See the
   trade_log.csv daily_pnl column for the real outcome.
 
@@ -25,14 +36,18 @@ Safety model (read before running):
   trade against, independently of LIVE_CONFIRM (which picks quote-only vs.
   actually buying) — e.g. account=demo + live_confirm=yes runs the full
   buy/settle loop with play money.
-- Defaults to DRY_RUN: fetches one live proposal (real payout quote) but does
-  NOT buy, so you can verify connectivity, symbol, barrier, and logging
-  before any money moves. Set LIVE_CONFIRM=yes in .env to place real trades.
-- Hard circuit breakers stop a session automatically: MAX_DAILY_LOSS (dollar
+- Defaults to DRY_RUN: on every trigger digit, fetches one live proposal
+  (real payout quote) but does NOT buy, so you can verify connectivity,
+  symbol, and logging before any money moves. Set LIVE_CONFIRM=yes in .env to
+  place real trades.
+- Hard circuit breakers stop trading automatically: MAX_DAILY_LOSS (dollar
   cap) and MAX_ATTEMPTS (trade-count cap). These do not create an edge —
   they bound how much a bad day can cost.
 - No martingale/progressive staking: every trade uses the same flat STAKE
   from .env, and STAKE must be > 0.
+- If the websocket drops (network blip, laptop sleep/wake), the bot
+  reconnects automatically with backoff — it does not need to be restarted
+  by hand.
 """
 
 import asyncio
@@ -78,8 +93,9 @@ class Config:
     app_id: str
     account: str  # "demo" or "real" — which Deriv account to trade against
     symbol: str
-    direction: str  # "OVER" or "UNDER"
-    barrier: str  # "0".."9"
+    direction: str  # "OVER" or "UNDER" — used only by --once (run_once)
+    barrier: str  # "0".."9" — used only by --once (run_once)
+    digit_trigger: str  # "0".."9" — watched digit for the default watch_and_trade mode
     stake: float
     currency: str
     duration: int
@@ -118,6 +134,10 @@ class Config:
         if barrier not in [str(d) for d in range(10)]:
             raise SystemExit("BARRIER must be a single digit 0-9")
 
+        digit_trigger = get("DIGIT_TRIGGER", "0")
+        if digit_trigger not in [str(d) for d in range(10)]:
+            raise SystemExit("DIGIT_TRIGGER must be a single digit 0-9")
+
         stake = float(get("STAKE", "1.0"))
         if stake <= 0:
             raise SystemExit("STAKE must be greater than 0")
@@ -128,6 +148,7 @@ class Config:
             symbol=get("SYMBOL", "R_100"),
             direction=direction,
             barrier=barrier,
+            digit_trigger=digit_trigger,
             stake=stake,
             currency=get("CURRENCY", "USD"),
             duration=int(get("DURATION", "1")),
@@ -277,6 +298,17 @@ class DerivClient:
         msg = await self._request({"balance": 1})
         return msg["balance"]
 
+    async def subscribe_ticks(self, symbol: str) -> tuple[int, "asyncio.Queue"]:
+        """Starts a live tick subscription; caller reads messages off the
+        returned queue (each one a raw {"tick": {...}} or {"error": {...}}
+        dict) for as long as the connection stays open."""
+        assert self.ws is not None, "call connect() first"
+        req_id = next(self._req_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        self._sub_queues[req_id] = queue
+        await self.ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": req_id}))
+        return req_id, queue
+
     async def get_proposal(
         self,
         contract_type: str,
@@ -388,6 +420,8 @@ class RiskManager:
 
 
 def describe_contract(contract_type: str, barrier: str) -> str:
+    if contract_type == "DIGITDIFF":
+        return f"differs from {barrier}"
     return f"{'over' if contract_type == 'DIGITOVER' else 'under'} {barrier}"
 
 
@@ -600,17 +634,230 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
         await client.close()
 
 
-async def run():
-    """CLI entrypoint: runs a single session using .env config, then exits.
-    For scheduled/repeated runs, use server.py behind an external cron caller."""
+# ---------------------------------------------------------------------------
+# Always-on digit-trigger loop (the default CLI mode)
+# ---------------------------------------------------------------------------
+
+
+def _last_digit(tick: dict) -> str:
+    pip_size = tick.get("pip_size", 2)
+    quote = float(tick["quote"])
+    return f"{quote:.{pip_size}f}"[-1]
+
+
+def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
+    """Rebuilds today's (UTC) risk state from trade_log.csv. Without this, a
+    process restart (Render redeploy, crash, platform maintenance) would
+    silently reset trades_done/daily_pnl to zero, letting the bot exceed
+    MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Only counts LIVE rows for
+    this exact account/symbol/contract_type/barrier — DRY_RUN quote rows and
+    unrelated runs (e.g. --once) don't count."""
+    risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts)
+    if not log_file.exists():
+        return risk
+    today = datetime.now(timezone.utc).date().isoformat()
+    with log_file.open("r", newline="") as f:
+        for row in csv.DictReader(f):
+            if not row.get("timestamp", "").startswith(today):
+                continue
+            if row.get("mode") != "LIVE":
+                continue
+            if row.get("account") != cfg.account or row.get("symbol") != cfg.symbol:
+                continue
+            if row.get("contract_type") != "DIGITDIFF" or row.get("barrier") != cfg.digit_trigger:
+                continue
+            profit_raw = row.get("profit", "")
+            if profit_raw == "":
+                continue
+            risk.record(float(profit_raw))
+    if risk.trades_done:
+        print(
+            f"Rehydrated today's risk state from {log_file.name}: "
+            f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f} won={risk.won}"
+        )
+    return risk
+
+
+async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
+    """Runs forever: stays connected to cfg.symbol's live tick stream and
+    fires a DIGITDIFF trade (barrier=cfg.digit_trigger) the instant a tick's
+    last digit equals cfg.digit_trigger. RiskManager's daily caps and
+    stop-on-first-win rule still apply per UTC calendar day — once capped,
+    this keeps watching ticks (so it notices the day roll over) but stops
+    placing trades until then. Reconnects with exponential backoff on any
+    websocket/API error, and tolerates not being logged in yet (missing
+    deriv_tokens.json) by waiting and retrying instead of exiting — useful
+    when this runs as a server background task that starts before /login has
+    been visited. Returns only on cancellation (the caller's job)."""
+    mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
+    contract_type = "DIGITDIFF"
+    print(
+        f"=== Deriv digit-trigger bot | {mode} | account={cfg.account} symbol={cfg.symbol} "
+        f"trigger_digit={cfg.digit_trigger} stake={cfg.stake} ==="
+    )
+
+    current_day = datetime.now(timezone.utc).date()
+    risk = rehydrate_risk(cfg, cfg.log_file)
+    capped_notified = False
+    backoff = 2
+
+    while True:
+        client = None
+        try:
+            tokens = ensure_access_token(load_tokens())
+            account_id = pick_account(tokens, cfg.account)
+            client = DerivClient(cfg.app_id, tokens["access_token"], account_id)
+            await client.connect()
+            bal = await client.get_balance()
+            print(f"Connected to {bal['loginid']} | balance: {bal['balance']} {bal['currency']}")
+            backoff = 2  # reset once a connection actually succeeds
+
+            _, queue = await client.subscribe_ticks(cfg.symbol)
+            print(f"Watching {cfg.symbol} ticks for last digit == {cfg.digit_trigger} ...")
+
+            while True:
+                today = datetime.now(timezone.utc).date()
+                if today != current_day:
+                    print(f"New day ({today}) — daily risk counters reset, trading resumes.")
+                    current_day = today
+                    risk = rehydrate_risk(cfg, cfg.log_file)
+                    capped_notified = False
+
+                msg = await queue.get()
+                if "error" in msg:
+                    raise DerivApiError(msg["error"].get("message", "tick stream error"))
+
+                tick = msg.get("tick")
+                if not tick:
+                    continue
+
+                if _last_digit(tick) != cfg.digit_trigger:
+                    continue
+
+                if not risk.can_trade():
+                    if not capped_notified:
+                        print(f"Trigger digit seen but not trading — {risk.stop_reason}. Still watching for tomorrow.")
+                        capped_notified = True
+                    continue
+
+                ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                print(f"[{ts}] trigger digit {cfg.digit_trigger} seen on {cfg.symbol} @ {tick['quote']}")
+
+                try:
+                    proposal = await client.get_proposal(
+                        contract_type, cfg.digit_trigger, cfg.stake, cfg.duration,
+                        cfg.duration_unit, cfg.symbol, cfg.currency,
+                    )
+                    ask_price = float(proposal["ask_price"])
+                    payout = float(proposal["payout"])
+                except DerivApiError as e:
+                    print(f"Proposal error: {e}")
+                    continue
+
+                if mode == "DRY_RUN":
+                    print(
+                        f"[DRY_RUN] {contract_type} barrier={cfg.digit_trigger} stake={ask_price:.2f} "
+                        f"payout={payout:.2f} — quote only, no purchase made"
+                    )
+                    logger.log(
+                        timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                        contract_type=contract_type, barrier=cfg.digit_trigger, stake=ask_price, payout=payout,
+                    )
+                    continue
+
+                print(
+                    f"  attempt {risk.trades_done + 1}/{cfg.max_attempts} stake={ask_price:.2f} payout={payout:.2f}"
+                )
+                try:
+                    bought = await client.buy(proposal["id"], ask_price)
+                    settled = await client.wait_for_settlement(bought["contract_id"])
+                except DerivApiError as e:
+                    print(f"Trade error: {e}")
+                    continue
+
+                profit = float(settled.get("profit", 0))
+                risk.record(profit)
+
+                try:
+                    balance = await client.get_balance()
+                    balance_after = balance["balance"]
+                except DerivApiError:
+                    balance_after = ""
+
+                logger.log(
+                    timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                    contract_type=contract_type, barrier=cfg.digit_trigger, stake=ask_price, payout=payout,
+                    profit=profit, balance_after=balance_after, contract_id=bought.get("contract_id"),
+                )
+
+                result = "WON" if profit > 0 else "LOST"
+                print(
+                    f"  -> {result} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
+                    f"| attempts={risk.trades_done}/{cfg.max_attempts}"
+                )
+                trade_desc = describe_contract(contract_type, cfg.digit_trigger)
+                headline = (
+                    f"✅ Trade won: +{profit:.2f} {cfg.currency}" if profit > 0
+                    else f"❌ Trade lost: {profit:.2f} {cfg.currency}"
+                )
+                send_telegram_message(
+                    cfg,
+                    f"{headline}\n{cfg.symbol}, {trade_desc}, {cfg.account} account\n"
+                    f"📊 Attempt {risk.trades_done} of {cfg.max_attempts} today — running total: "
+                    f"{risk.daily_pnl:+.2f} {cfg.currency}",
+                )
+
+                if not risk.can_trade() and not capped_notified:
+                    capped_notified = True
+                    print(
+                        f"Trading paused for today ({risk.stop_reason}) | net daily_pnl={risk.daily_pnl:+.2f} "
+                        "— still watching, will resume automatically tomorrow."
+                    )
+                    send_telegram_message(
+                        cfg,
+                        f"🏁 Trading paused for today — {risk.stop_reason}.\n"
+                        f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
+                    )
+
+        except SystemExit as e:
+            print(f"Not ready to trade yet ({e}) — retrying in {backoff}s. Visit /login if you haven't yet.")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except (DerivApiError, ConnectionClosed, OSError) as e:
+            print(f"Connection error: {e} — reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        finally:
+            if client:
+                await client.close()
+
+
+async def run_once():
+    """Single-shot mode (`--once`): one blind OVER/UNDER session using
+    DIRECTION/BARRIER from .env, then exit. This is the old cron-triggered
+    behavior, and what server.py's /run endpoint calls."""
     cfg = Config.load()
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
     contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
     logger = TradeLogger(cfg.log_file)
-    print(f"=== Deriv Over/Under bot | {mode} | account={cfg.account} stake={cfg.stake} app_id={cfg.app_id} ===")
+    print(f"=== Deriv Over/Under bot (single run) | {mode} | account={cfg.account} stake={cfg.stake} app_id={cfg.app_id} ===")
     try:
         summary = await run_session(cfg, contract_type, mode, logger)
         print(summary)
+    finally:
+        logger.close()
+
+
+async def run():
+    """CLI entrypoint. Default: runs forever via watch_and_trade (see its
+    docstring). Pass --once for a single blind OVER/UNDER session instead."""
+    if "--once" in sys.argv:
+        await run_once()
+        return
+    cfg = Config.load()
+    logger = TradeLogger(cfg.log_file)
+    try:
+        await watch_and_trade(cfg, logger)
     finally:
         logger.close()
 
