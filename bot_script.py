@@ -691,7 +691,8 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
                 continue
             if row.get("account") != cfg.account or row.get("symbol") != cfg.symbol:
                 continue
-            if row.get("contract_type") != "DIGITDIFF" or row.get("barrier") != cfg.digit_trigger:
+            expected_contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
+            if row.get("contract_type") != expected_contract_type or row.get("barrier") != cfg.barrier:
                 continue
             profit_raw = row.get("profit", "")
             if profit_raw == "":
@@ -706,11 +707,13 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
 
 
 async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
-    """Runs forever: stays connected to cfg.symbol's live tick stream and
-    fires a DIGITDIFF trade (barrier=cfg.digit_trigger) the instant a tick's
-    last digit equals cfg.digit_trigger — through any number of wins, all
-    day, stopping for the day the moment one trade loses (RiskManager runs
-    with stop_on_win=False, stop_on_loss=True here). MAX_ATTEMPTS and
+    """Runs forever: stays connected to cfg.symbol's live tick stream and,
+    the instant a tick's last digit equals cfg.digit_trigger, fires a
+    DIGITOVER/DIGITUNDER trade (per cfg.direction, barrier=cfg.barrier) —
+    the trigger digit decides WHEN to trade, cfg.direction/cfg.barrier
+    decide WHAT to bet. Trades through any number of wins, all day, stopping
+    for the day the moment one trade loses (RiskManager runs with
+    stop_on_win=False, stop_on_loss=True here). MAX_ATTEMPTS and
     MAX_DAILY_LOSS remain as backstops. Once stopped, this keeps watching
     ticks (so it notices the day roll over) but stops placing trades until
     then. Reconnects with exponential backoff on any websocket/API error,
@@ -719,10 +722,10 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
     server background task that starts before /login has been visited.
     Returns only on cancellation (the caller's job)."""
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
-    contract_type = "DIGITDIFF"
+    contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
     print(
         f"=== Deriv digit-trigger bot | {mode} | account={cfg.account} symbol={cfg.symbol} "
-        f"trigger_digit={cfg.digit_trigger} stake={cfg.stake} ==="
+        f"trigger_digit={cfg.digit_trigger} trade={contract_type} barrier={cfg.barrier} stake={cfg.stake} ==="
     )
 
     current_day = datetime.now(timezone.utc).date()
@@ -774,7 +777,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
 
                 try:
                     proposal = await client.get_proposal(
-                        contract_type, cfg.digit_trigger, cfg.stake, cfg.duration,
+                        contract_type, cfg.barrier, cfg.stake, cfg.duration,
                         cfg.duration_unit, cfg.symbol, cfg.currency,
                     )
                     ask_price = float(proposal["ask_price"])
@@ -785,12 +788,12 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
 
                 if mode == "DRY_RUN":
                     print(
-                        f"[DRY_RUN] {contract_type} barrier={cfg.digit_trigger} stake={ask_price:.2f} "
+                        f"[DRY_RUN] {contract_type} barrier={cfg.barrier} stake={ask_price:.2f} "
                         f"payout={payout:.2f} — quote only, no purchase made"
                     )
                     logger.log(
                         timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
-                        contract_type=contract_type, barrier=cfg.digit_trigger, stake=ask_price, payout=payout,
+                        contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
                     )
                     continue
 
@@ -815,7 +818,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
 
                 logger.log(
                     timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
-                    contract_type=contract_type, barrier=cfg.digit_trigger, stake=ask_price, payout=payout,
+                    contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
                     profit=profit, balance_after=balance_after, contract_id=bought.get("contract_id"),
                 )
 
@@ -824,7 +827,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     f"  -> {result} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
                     f"| attempts={risk.trades_done}/{cfg.max_attempts}"
                 )
-                trade_desc = describe_contract(contract_type, cfg.digit_trigger)
+                trade_desc = describe_contract(contract_type, cfg.barrier)
                 headline = (
                     f"✅ Trade won: +{profit:.2f} {cfg.currency}" if profit > 0
                     else f"❌ Trade lost: {profit:.2f} {cfg.currency}"
