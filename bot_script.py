@@ -16,17 +16,18 @@ server.py's /run HTTP endpoint calls too (for an external cron/Render setup).
 
 Session/day mechanic (by design, not an accident):
 - Within a calendar day (UTC), the bot fires a flat-stake trigger trade on
-  EVERY tick that matches DIGIT_TRIGGER, win or lose, until either (a)
-  MAX_ATTEMPTS is reached, or (b) MAX_DAILY_LOSS is hit — whichever comes
-  first. It does not stop after a win. Once either cap is hit, it stops
-  TRADING for the rest of that day but keeps watching ticks, and
-  automatically resumes trading right after the date rolls over.
+  EVERY tick that matches DIGIT_TRIGGER — through any number of wins — until
+  the FIRST losing trade, or MAX_ATTEMPTS, or MAX_DAILY_LOSS, whichever
+  comes first. It does not stop after a win; it stops after exactly one
+  loss, regardless of that loss's size. Once stopped, it stops TRADING for
+  the rest of that day but keeps watching ticks, and automatically resumes
+  trading right after the date rolls over.
 - IMPORTANT: trading all day does not guarantee the day is profitable — no
   staking scheme can change that against a random, house-edged game. See the
-  trade_log.csv daily_pnl column for the real outcome, and size STAKE and
-  MAX_DAILY_LOSS so that a string of losses is something you can actually
-  afford (MAX_DAILY_LOSS only stops further trades once breached — a single
-  STAKE-sized loss can still exceed it).
+  trade_log.csv daily_pnl column for the real outcome. MAX_DAILY_LOSS and
+  MAX_ATTEMPTS remain as backstops behind the stop-on-first-loss rule, but
+  size STAKE with the stop-on-first-loss rule in mind: the single loss that
+  ends the day can be as large as one STAKE.
 
 Safety model (read before running):
 - Credentials come from a local .env file next to this script — never hardcode
@@ -393,17 +394,29 @@ class RiskManager:
     `stop_on_win` additionally stops trading after the very first winning
     trade. This is the legacy single-shot (--once / server.py's /run)
     session model: "stop as soon as you're up, don't try to grind out more."
-    The continuous watch_and_trade loop sets stop_on_win=False so it keeps
-    firing on every trigger digit all day, win or lose, until a hard cap is
-    hit.
+
+    `stop_on_loss` stops trading after the very first LOSING trade,
+    regardless of its size or the cumulative daily_pnl — a single loss ends
+    the day, not a dollar threshold. This is distinct from MAX_DAILY_LOSS,
+    which only stops trading once cumulative losses cross a dollar amount;
+    with stop_on_loss=True, MAX_DAILY_LOSS still applies too, but as a
+    backstop that (given the flag) will essentially never be the reason
+    trading stops.
+
+    The continuous watch_and_trade loop sets stop_on_win=False and
+    stop_on_loss=True: it keeps firing on every trigger digit all day
+    through any number of wins, and stops for the day the moment one trade
+    loses.
     """
 
     max_daily_loss: float
     max_attempts: int
     stop_on_win: bool = True
+    stop_on_loss: bool = False
     daily_pnl: float = 0.0
     trades_done: int = 0
     won: bool = False
+    lost: bool = False
     stop_reason: str | None = None
 
     def can_trade(self) -> bool:
@@ -411,6 +424,8 @@ class RiskManager:
             return False
         if self.stop_on_win and self.won:
             self.stop_reason = "won a trade — session goal met for today"
+        elif self.stop_on_loss and self.lost:
+            self.stop_reason = "lost a trade — stopping for today"
         elif self.trades_done >= self.max_attempts:
             self.stop_reason = f"reached max attempts ({self.max_attempts})"
         elif self.daily_pnl <= -abs(self.max_daily_loss):
@@ -422,6 +437,8 @@ class RiskManager:
         self.daily_pnl += profit
         if profit > 0:
             self.won = True
+        else:
+            self.lost = True
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +679,7 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Only counts LIVE rows for
     this exact account/symbol/contract_type/barrier — DRY_RUN quote rows and
     unrelated runs (e.g. --once) don't count."""
-    risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False)
+    risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=True)
     if not log_file.exists():
         return risk
     today = datetime.now(timezone.utc).date().isoformat()
@@ -683,7 +700,7 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     if risk.trades_done:
         print(
             f"Rehydrated today's risk state from {log_file.name}: "
-            f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f} won={risk.won}"
+            f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f} won={risk.won} lost={risk.lost}"
         )
     return risk
 
@@ -691,15 +708,16 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
 async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
     """Runs forever: stays connected to cfg.symbol's live tick stream and
     fires a DIGITDIFF trade (barrier=cfg.digit_trigger) the instant a tick's
-    last digit equals cfg.digit_trigger — every time, win or lose, all day.
-    RiskManager runs with stop_on_win=False here, so only MAX_ATTEMPTS or
-    MAX_DAILY_LOSS stop trading for the day (per UTC calendar day) — once
-    either is hit, this keeps watching ticks (so it notices the day roll
-    over) but stops placing trades until then. Reconnects with exponential
-    backoff on any websocket/API error, and tolerates not being logged in yet (missing
-    deriv_tokens.json) by waiting and retrying instead of exiting — useful
-    when this runs as a server background task that starts before /login has
-    been visited. Returns only on cancellation (the caller's job)."""
+    last digit equals cfg.digit_trigger — through any number of wins, all
+    day, stopping for the day the moment one trade loses (RiskManager runs
+    with stop_on_win=False, stop_on_loss=True here). MAX_ATTEMPTS and
+    MAX_DAILY_LOSS remain as backstops. Once stopped, this keeps watching
+    ticks (so it notices the day roll over) but stops placing trades until
+    then. Reconnects with exponential backoff on any websocket/API error,
+    and tolerates not being logged in yet (missing deriv_tokens.json) by
+    waiting and retrying instead of exiting — useful when this runs as a
+    server background task that starts before /login has been visited.
+    Returns only on cancellation (the caller's job)."""
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
     contract_type = "DIGITDIFF"
     print(
