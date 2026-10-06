@@ -95,10 +95,12 @@ def load_env_file(path: Path) -> dict:
 class Config:
     app_id: str
     account: str  # "demo" or "real" — which Deriv account to trade against
-    symbol: str
+    symbol: str  # used by --once (run_once)
+    symbols: list[str]  # instruments watch_and_trade watches at once (SYMBOLS, else [SYMBOL])
     direction: str  # "OVER" or "UNDER" — used only by --once (run_once)
     barrier: str  # "0".."9" — used only by --once (run_once)
     digit_trigger: str  # "0".."9" — watched digit for the default watch_and_trade mode
+    digit_trigger_count: int  # consecutive trigger digits required before a trade fires
     stake: float
     currency: str
     duration: int
@@ -141,6 +143,10 @@ class Config:
         if digit_trigger not in [str(d) for d in range(10)]:
             raise SystemExit("DIGIT_TRIGGER must be a single digit 0-9")
 
+        digit_trigger_count = int(get("DIGIT_TRIGGER_COUNT", "1"))
+        if digit_trigger_count < 1:
+            raise SystemExit("DIGIT_TRIGGER_COUNT must be 1 or more")
+
         stake = float(get("STAKE", "1.0"))
         if stake <= 0:
             raise SystemExit("STAKE must be greater than 0")
@@ -149,9 +155,11 @@ class Config:
             app_id=app_id,
             account=account,
             symbol=get("SYMBOL", "R_100"),
+            symbols=[x.strip() for x in get("SYMBOLS", get("SYMBOL", "R_100")).split(",") if x.strip()],
             direction=direction,
             barrier=barrier,
             digit_trigger=digit_trigger,
+            digit_trigger_count=digit_trigger_count,
             stake=stake,
             currency=get("CURRENCY", "USD"),
             duration=int(get("DURATION", "1")),
@@ -301,13 +309,18 @@ class DerivClient:
         msg = await self._request({"balance": 1})
         return msg["balance"]
 
-    async def subscribe_ticks(self, symbol: str) -> tuple[int, "asyncio.Queue"]:
+    async def subscribe_ticks(
+        self, symbol: str, queue: "asyncio.Queue | None" = None
+    ) -> tuple[int, "asyncio.Queue"]:
         """Starts a live tick subscription; caller reads messages off the
         returned queue (each one a raw {"tick": {...}} or {"error": {...}}
-        dict) for as long as the connection stays open."""
+        dict) for as long as the connection stays open. Pass the same queue
+        for several symbols to merge their streams (tick["symbol"] tells
+        them apart)."""
         assert self.ws is not None, "call connect() first"
         req_id = next(self._req_id)
-        queue: asyncio.Queue = asyncio.Queue()
+        if queue is None:
+            queue = asyncio.Queue()
         self._sub_queues[req_id] = queue
         await self.ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": req_id}))
         return req_id, queue
@@ -677,7 +690,7 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     process restart (Render redeploy, crash, platform maintenance) would
     silently reset trades_done/daily_pnl to zero, letting the bot exceed
     MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Only counts LIVE rows for
-    this exact account/symbol/contract_type/barrier — DRY_RUN quote rows and
+    this exact account/contract_type/barrier on any of cfg.symbols — DRY_RUN quote rows and
     unrelated runs (e.g. --once) don't count."""
     risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=True)
     if not log_file.exists():
@@ -689,7 +702,7 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
                 continue
             if row.get("mode") != "LIVE":
                 continue
-            if row.get("account") != cfg.account or row.get("symbol") != cfg.symbol:
+            if row.get("account") != cfg.account or row.get("symbol") not in cfg.symbols:
                 continue
             expected_contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
             if row.get("contract_type") != expected_contract_type or row.get("barrier") != cfg.barrier:
@@ -724,8 +737,8 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
     contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
     print(
-        f"=== Deriv digit-trigger bot | {mode} | account={cfg.account} symbol={cfg.symbol} "
-        f"trigger_digit={cfg.digit_trigger} trade={contract_type} barrier={cfg.barrier} stake={cfg.stake} ==="
+        f"=== Deriv digit-trigger bot | {mode} | account={cfg.account} symbols={','.join(cfg.symbols)} "
+        f"trigger_digit={cfg.digit_trigger}x{cfg.digit_trigger_count} trade={contract_type} barrier={cfg.barrier} stake={cfg.stake} ==="
     )
 
     current_day = datetime.now(timezone.utc).date()
@@ -744,8 +757,14 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
             print(f"Connected to {bal['loginid']} | balance: {bal['balance']} {bal['currency']}")
             backoff = 2  # reset once a connection actually succeeds
 
-            _, queue = await client.subscribe_ticks(cfg.symbol)
-            print(f"Watching {cfg.symbol} ticks for last digit == {cfg.digit_trigger} ...")
+            queue: asyncio.Queue = asyncio.Queue()
+            for sym in cfg.symbols:
+                await client.subscribe_ticks(sym, queue)
+            print(
+                f"Watching {', '.join(cfg.symbols)} ticks for {cfg.digit_trigger_count} consecutive "
+                f"last digit(s) == {cfg.digit_trigger} ..."
+            )
+            streaks: dict[str, int] = {}  # per symbol: consecutive ticks ending in the trigger digit
 
             while True:
                 today = datetime.now(timezone.utc).date()
@@ -763,8 +782,15 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                 if not tick:
                     continue
 
+                symbol = tick["symbol"]
                 if _last_digit(tick) != cfg.digit_trigger:
+                    streaks[symbol] = 0
                     continue
+                streaks[symbol] = streaks.get(symbol, 0) + 1
+                if streaks[symbol] < cfg.digit_trigger_count:
+                    continue
+                # A run fires one trade; the streak must rebuild from scratch for the next.
+                streaks[symbol] = 0
 
                 if not risk.can_trade():
                     if not capped_notified:
@@ -773,12 +799,12 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     continue
 
                 ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                print(f"[{ts}] trigger digit {cfg.digit_trigger} seen on {cfg.symbol} @ {tick['quote']}")
+                print(f"[{ts}] trigger digit {cfg.digit_trigger} seen {cfg.digit_trigger_count}x in a row on {symbol} @ {tick['quote']}")
 
                 try:
                     proposal = await client.get_proposal(
                         contract_type, cfg.barrier, cfg.stake, cfg.duration,
-                        cfg.duration_unit, cfg.symbol, cfg.currency,
+                        cfg.duration_unit, symbol, cfg.currency,
                     )
                     ask_price = float(proposal["ask_price"])
                     payout = float(proposal["payout"])
@@ -792,7 +818,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                         f"payout={payout:.2f} — quote only, no purchase made"
                     )
                     logger.log(
-                        timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                        timestamp=ts, mode=mode, account=cfg.account, symbol=symbol,
                         contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
                     )
                     continue
@@ -817,7 +843,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     balance_after = ""
 
                 logger.log(
-                    timestamp=ts, mode=mode, account=cfg.account, symbol=cfg.symbol,
+                    timestamp=ts, mode=mode, account=cfg.account, symbol=symbol,
                     contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
                     profit=profit, balance_after=balance_after, contract_id=bought.get("contract_id"),
                 )
@@ -834,7 +860,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                 )
                 send_telegram_message(
                     cfg,
-                    f"{headline}\n{cfg.symbol}, {trade_desc}, {cfg.account} account\n"
+                    f"{headline}\n{symbol}, {trade_desc}, {cfg.account} account\n"
                     f"📊 Attempt {risk.trades_done} of {cfg.max_attempts} today — running total: "
                     f"{risk.daily_pnl:+.2f} {cfg.currency}",
                 )
@@ -850,6 +876,14 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                         f"🏁 Trading paused for today — {risk.stop_reason}.\n"
                         f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
                     )
+
+                # Ticks that queued up while this trade settled are stale; drop
+                # them so an old run on another symbol can't fire a late trade.
+                while not queue.empty():
+                    stale = queue.get_nowait()
+                    if "error" in stale:
+                        raise DerivApiError(stale["error"].get("message", "tick stream error"))
+                streaks.clear()
 
         except SystemExit as e:
             print(f"Not ready to trade yet ({e}) — retrying in {backoff}s. Visit /login if you haven't yet.")
