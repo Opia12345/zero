@@ -102,6 +102,8 @@ class Config:
     digit_trigger: str  # "0".."9" — watched digit for the default watch_and_trade mode
     digit_trigger_count: int  # consecutive trigger digits required before a trade fires
     stake: float
+    min_payout_ratio: float  # skip a trade when quoted payout / stake is below this (0 = off)
+    daily_profit_target: float  # stop trading for the day once daily P&L reaches this (0 = off)
     currency: str
     duration: int
     duration_unit: str
@@ -151,6 +153,11 @@ class Config:
         if stake <= 0:
             raise SystemExit("STAKE must be greater than 0")
 
+        min_payout_ratio = float(get("MIN_PAYOUT_RATIO", "0"))
+        daily_profit_target = float(get("DAILY_PROFIT_TARGET", "0"))
+        if min_payout_ratio < 0 or daily_profit_target < 0:
+            raise SystemExit("MIN_PAYOUT_RATIO and DAILY_PROFIT_TARGET must not be negative")
+
         return cls(
             app_id=app_id,
             account=account,
@@ -161,6 +168,8 @@ class Config:
             digit_trigger=digit_trigger,
             digit_trigger_count=digit_trigger_count,
             stake=stake,
+            min_payout_ratio=min_payout_ratio,
+            daily_profit_target=daily_profit_target,
             currency=get("CURRENCY", "USD"),
             duration=int(get("DURATION", "1")),
             duration_unit=get("DURATION_UNIT", "t"),
@@ -354,6 +363,37 @@ class DerivClient:
         msg = await self._request({"buy": proposal_id, "price": price})
         return msg["buy"]
 
+    async def buy_now(
+        self,
+        contract_type: str,
+        barrier: str,
+        stake: float,
+        duration: int,
+        duration_unit: str,
+        symbol: str,
+        currency: str,
+    ) -> dict:
+        """Buys straight from contract parameters in ONE round trip, with no
+        proposal first. `price` is the most we'll pay, so a worse quote is
+        rejected instead of filled."""
+        msg = await self._request(
+            {
+                "buy": 1,
+                "price": stake,
+                "parameters": {
+                    "contract_type": contract_type,
+                    "amount": stake,
+                    "basis": "stake",
+                    "currency": currency,
+                    "duration": duration,
+                    "duration_unit": duration_unit,
+                    "underlying_symbol": symbol,
+                    "barrier": barrier,
+                },
+            }
+        )
+        return msg["buy"]
+
     async def wait_for_settlement(self, contract_id: int, timeout: float = 60.0) -> dict:
         assert self.ws is not None, "call connect() first"
         req_id = next(self._req_id)
@@ -426,6 +466,7 @@ class RiskManager:
     max_attempts: int
     stop_on_win: bool = True
     stop_on_loss: bool = False
+    profit_target: float = 0.0  # 0 = off; stop for the day once daily_pnl reaches it
     daily_pnl: float = 0.0
     trades_done: int = 0
     won: bool = False
@@ -439,6 +480,8 @@ class RiskManager:
             self.stop_reason = "won a trade — session goal met for today"
         elif self.stop_on_loss and self.lost:
             self.stop_reason = "lost a trade — stopping for today"
+        elif self.profit_target > 0 and self.daily_pnl >= self.profit_target - 1e-9:
+            self.stop_reason = f"hit daily profit target ({self.profit_target})"
         elif self.trades_done >= self.max_attempts:
             self.stop_reason = f"reached max attempts ({self.max_attempts})"
         elif self.daily_pnl <= -abs(self.max_daily_loss):
@@ -692,7 +735,10 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Only counts LIVE rows for
     this exact account/contract_type/barrier on any of cfg.symbols — DRY_RUN quote rows and
     unrelated runs (e.g. --once) don't count."""
-    risk = RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=True)
+    risk = RiskManager(
+        cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=True,
+        profit_target=cfg.daily_profit_target,
+    )
     if not log_file.exists():
         return risk
     today = datetime.now(timezone.utc).date().isoformat()
@@ -717,6 +763,22 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
             f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f} won={risk.won} lost={risk.lost}"
         )
     return risk
+
+
+async def refresh_payout_ratios(client: DerivClient, cfg: Config, contract_type: str, ratios: dict) -> None:
+    """Keeps ratios[symbol] = payout / stake fresh in the background so the
+    payout guard never costs a network round trip on the trade path."""
+    while True:
+        for sym in cfg.symbols:
+            try:
+                prop = await client.get_proposal(
+                    contract_type, cfg.barrier, cfg.stake, cfg.duration,
+                    cfg.duration_unit, sym, cfg.currency,
+                )
+                ratios[sym] = float(prop["payout"]) / float(prop["ask_price"])
+            except (DerivApiError, asyncio.TimeoutError):
+                pass
+        await asyncio.sleep(30)
 
 
 async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
@@ -748,6 +810,7 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
 
     while True:
         client = None
+        ratio_task = None
         try:
             tokens = ensure_access_token(load_tokens())
             account_id = pick_account(tokens, cfg.account)
@@ -765,6 +828,8 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                 f"last digit(s) == {cfg.digit_trigger} ..."
             )
             streaks: dict[str, int] = {}  # per symbol: consecutive ticks ending in the trigger digit
+            payout_ratios: dict[str, float] = {}
+            ratio_task = asyncio.create_task(refresh_payout_ratios(client, cfg, contract_type, payout_ratios))
 
             while True:
                 today = datetime.now(timezone.utc).date()
@@ -801,18 +866,17 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                 ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 print(f"[{ts}] trigger digit {cfg.digit_trigger} seen {cfg.digit_trigger_count}x in a row on {symbol} @ {tick['quote']}")
 
-                try:
-                    proposal = await client.get_proposal(
-                        contract_type, cfg.barrier, cfg.stake, cfg.duration,
-                        cfg.duration_unit, symbol, cfg.currency,
-                    )
-                    ask_price = float(proposal["ask_price"])
-                    payout = float(proposal["payout"])
-                except DerivApiError as e:
-                    print(f"Proposal error: {e}")
-                    continue
-
                 if mode == "DRY_RUN":
+                    try:
+                        proposal = await client.get_proposal(
+                            contract_type, cfg.barrier, cfg.stake, cfg.duration,
+                            cfg.duration_unit, symbol, cfg.currency,
+                        )
+                        ask_price = float(proposal["ask_price"])
+                        payout = float(proposal["payout"])
+                    except DerivApiError as e:
+                        print(f"Proposal error: {e}")
+                        continue
                     print(
                         f"[DRY_RUN] {contract_type} barrier={cfg.barrier} stake={ask_price:.2f} "
                         f"payout={payout:.2f} — quote only, no purchase made"
@@ -823,13 +887,27 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     )
                     continue
 
-                print(
-                    f"  attempt {risk.trades_done + 1}/{cfg.max_attempts} stake={ask_price:.2f} payout={payout:.2f}"
-                )
+                # Guard uses the background-refreshed quote (no round trip on
+                # the hot path); no quote yet means we can't vouch for it, so skip.
+                if cfg.min_payout_ratio:
+                    ratio = payout_ratios.get(symbol)
+                    if ratio is None or ratio < cfg.min_payout_ratio:
+                        shown = "no quote yet" if ratio is None else f"{ratio:.3f}x stake"
+                        print(f"  skipped: payout {shown}, MIN_PAYOUT_RATIO {cfg.min_payout_ratio}")
+                        continue
+
+                print(f"  attempt {risk.trades_done + 1}/{cfg.max_attempts} buying now")
                 try:
-                    bought = await client.buy(proposal["id"], ask_price)
+                    sent = time.monotonic()
+                    bought = await client.buy_now(
+                        contract_type, cfg.barrier, cfg.stake, cfg.duration,
+                        cfg.duration_unit, symbol, cfg.currency,
+                    )
+                    print(f"  buy confirmed in {(time.monotonic() - sent) * 1000:.0f} ms")
+                    ask_price = float(bought.get("buy_price", cfg.stake))
+                    payout = float(bought.get("payout", 0))
                     settled = await client.wait_for_settlement(bought["contract_id"])
-                except DerivApiError as e:
+                except (DerivApiError, asyncio.TimeoutError) as e:
                     print(f"Trade error: {e}")
                     continue
 
@@ -894,6 +972,8 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         finally:
+            if ratio_task:
+                ratio_task.cancel()
             if client:
                 await client.close()
 
