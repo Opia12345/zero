@@ -1,33 +1,31 @@
 """
-Deriv digit-trigger trading bot.
+Deriv digit-contract bot (quote-quality strategy).
 
-Default mode (CLI: `python bot_script.py`) runs forever as a local, always-on
-process: it stays connected, watches every live tick on SYMBOL, and only
-places a trade the instant a tick's last digit equals DIGIT_TRIGGER (default
-"0"). The trade placed is DIGITDIFF barrier=DIGIT_TRIGGER — i.e. "bet the
-NEXT digit differs from the trigger digit". Just start it and leave the
-terminal open (or run it under `caffeinate -i python bot_script.py` on macOS
-so the trade loop keeps running even if the display sleeps); it keeps trading
-for as long as your machine is on and connected. Stop it with Ctrl+C.
+Last digits on Deriv's synthetic indices are independent and uniform, so no
+digit pattern predicts the next tick, and there is no "right moment" to trade.
+What does vary is the house edge baked into each live quote. For a contract
+with true win probability p, stake s and payout P, RTP = p * P / s; RTP < 1
+means a negative expected value. See strategy.py.
+
+Default mode (CLI: `python bot_script.py`) runs forever: each cycle it quotes
+every digit contract (over/under/differs/matches/even/odd) on every symbol in
+SYMBOLS, and buys the single highest-RTP quote, but only if its RTP >= MIN_RTP.
+If nothing qualifies it waits SCAN_INTERVAL seconds and looks again. This
+minimises the expected cost per trade. It does NOT create an edge: expect a
+slow net loss over many trades. Treat it as paid entertainment, not income.
 
 `python bot_script.py --once` keeps the old behavior instead: a single blind
 OVER/UNDER session using DIRECTION/BARRIER from .env, then exit. That's what
 server.py's /run HTTP endpoint calls too (for an external cron/Render setup).
 
-Session/day mechanic (by design, not an accident):
-- Within a calendar day (UTC), the bot fires a flat-stake trigger trade on
-  EVERY tick that matches DIGIT_TRIGGER — through any number of wins — until
-  the FIRST losing trade, or MAX_ATTEMPTS, or MAX_DAILY_LOSS, whichever
-  comes first. It does not stop after a win; it stops after exactly one
-  loss, regardless of that loss's size. Once stopped, it stops TRADING for
-  the rest of that day but keeps watching ticks, and automatically resumes
-  trading right after the date rolls over.
-- IMPORTANT: trading all day does not guarantee the day is profitable — no
-  staking scheme can change that against a random, house-edged game. See the
-  trade_log.csv daily_pnl column for the real outcome. MAX_DAILY_LOSS and
-  MAX_ATTEMPTS remain as backstops behind the stop-on-first-loss rule, but
-  size STAKE with the stop-on-first-loss rule in mind: the single loss that
-  ends the day can be as large as one STAKE.
+Risk bounds (per UTC day; they cap the damage, they don't change the odds):
+- MAX_DAILY_LOSS (dollars) and MAX_ATTEMPTS (trade count) stop trading for the
+  day; DAILY_PROFIT_TARGET (optional) also stops it. Once stopped the bot idles
+  and resumes after the date rolls over. Counters are rebuilt from the trade
+  log on restart.
+- Flat STAKE only. No martingale/progressive staking.
+- A realised-win-count z-score is printed after each trade. It exists to catch
+  bugs (wrong contract mapping, changed product), not to find an edge.
 
 Safety model (read before running):
 - Credentials come from a local .env file next to this script — never hardcode
@@ -39,18 +37,9 @@ Safety model (read before running):
   trade against, independently of LIVE_CONFIRM (which picks quote-only vs.
   actually buying) — e.g. account=demo + live_confirm=yes runs the full
   buy/settle loop with play money.
-- Defaults to DRY_RUN: on every trigger digit, fetches one live proposal
-  (real payout quote) but does NOT buy, so you can verify connectivity,
-  symbol, and logging before any money moves. Set LIVE_CONFIRM=yes in .env to
-  place real trades.
-- Hard circuit breakers stop trading automatically: MAX_DAILY_LOSS (dollar
-  cap) and MAX_ATTEMPTS (trade-count cap). These do not create an edge —
-  they bound how much a bad day can cost.
-- No martingale/progressive staking: every trade uses the same flat STAKE
-  from .env, and STAKE must be > 0.
-- If the websocket drops (network blip, laptop sleep/wake), the bot
-  reconnects automatically with backoff — it does not need to be restarted
-  by hand.
+- Defaults to DRY_RUN: logs the best quote each cycle but does NOT buy. Set
+  LIVE_CONFIRM=yes in .env to place trades.
+- If the websocket drops, the bot reconnects automatically with backoff.
 """
 
 import asyncio
@@ -65,6 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from strategy import Contract, Quote, best_quote, contract_menu, win_rate_z
 from websockets.legacy.client import WebSocketClientProtocol, connect
 from websockets.exceptions import ConnectionClosed
 
@@ -99,10 +89,10 @@ class Config:
     symbols: list[str]  # instruments watch_and_trade watches at once (SYMBOLS, else [SYMBOL])
     direction: str  # "OVER" or "UNDER" — used only by --once (run_once)
     barrier: str  # "0".."9" — used only by --once (run_once)
-    digit_trigger: str  # "0".."9" — watched digit for the default watch_and_trade mode
-    digit_trigger_count: int  # consecutive trigger digits required before a trade fires
     stake: float
-    min_payout_ratio: float  # skip a trade when quoted payout / stake is below this (0 = off)
+    min_rtp: float  # only trade when the best quote's return-to-player is at least this
+    scan_interval: float  # seconds to wait after a scan finds nothing worth trading
+    trade_cooldown: float  # seconds to wait after a trade settles
     daily_profit_target: float  # stop trading for the day once daily P&L reaches this (0 = off)
     currency: str
     duration: int
@@ -141,22 +131,18 @@ class Config:
         if barrier not in [str(d) for d in range(10)]:
             raise SystemExit("BARRIER must be a single digit 0-9")
 
-        digit_trigger = get("DIGIT_TRIGGER", "0")
-        if digit_trigger not in [str(d) for d in range(10)]:
-            raise SystemExit("DIGIT_TRIGGER must be a single digit 0-9")
-
-        digit_trigger_count = int(get("DIGIT_TRIGGER_COUNT", "1"))
-        if digit_trigger_count < 1:
-            raise SystemExit("DIGIT_TRIGGER_COUNT must be 1 or more")
-
         stake = float(get("STAKE", "1.0"))
         if stake <= 0:
             raise SystemExit("STAKE must be greater than 0")
 
-        min_payout_ratio = float(get("MIN_PAYOUT_RATIO", "0"))
+        min_rtp = float(get("MIN_RTP", "0.95"))
+        if not 0 < min_rtp <= 1.5:
+            raise SystemExit("MIN_RTP must be between 0 and 1.5 (0.95 = accept at most a 5% house edge)")
+        scan_interval = float(get("SCAN_INTERVAL", "60"))
+        trade_cooldown = float(get("TRADE_COOLDOWN", "5"))
         daily_profit_target = float(get("DAILY_PROFIT_TARGET", "0"))
-        if min_payout_ratio < 0 or daily_profit_target < 0:
-            raise SystemExit("MIN_PAYOUT_RATIO and DAILY_PROFIT_TARGET must not be negative")
+        if scan_interval < 1 or trade_cooldown < 0 or daily_profit_target < 0:
+            raise SystemExit("SCAN_INTERVAL must be >= 1; TRADE_COOLDOWN and DAILY_PROFIT_TARGET must not be negative")
 
         return cls(
             app_id=app_id,
@@ -165,10 +151,10 @@ class Config:
             symbols=[x.strip() for x in get("SYMBOLS", get("SYMBOL", "R_100")).split(",") if x.strip()],
             direction=direction,
             barrier=barrier,
-            digit_trigger=digit_trigger,
-            digit_trigger_count=digit_trigger_count,
             stake=stake,
-            min_payout_ratio=min_payout_ratio,
+            min_rtp=min_rtp,
+            scan_interval=scan_interval,
+            trade_cooldown=trade_cooldown,
             daily_profit_target=daily_profit_target,
             currency=get("CURRENCY", "USD"),
             duration=int(get("DURATION", "1")),
@@ -337,26 +323,26 @@ class DerivClient:
     async def get_proposal(
         self,
         contract_type: str,
-        barrier: str,
+        barrier: str | None,
         stake: float,
         duration: int,
         duration_unit: str,
         symbol: str,
         currency: str,
     ) -> dict:
-        msg = await self._request(
-            {
-                "proposal": 1,
-                "contract_type": contract_type,
-                "amount": stake,
-                "basis": "stake",
-                "currency": currency,
-                "duration": duration,
-                "duration_unit": duration_unit,
-                "underlying_symbol": symbol,
-                "barrier": barrier,
-            }
-        )
+        payload = {
+            "proposal": 1,
+            "contract_type": contract_type,
+            "amount": stake,
+            "basis": "stake",
+            "currency": currency,
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+        }
+        if barrier is not None:  # EVEN/ODD take no barrier
+            payload["barrier"] = barrier
+        msg = await self._request(payload)
         return msg["proposal"]
 
     async def buy(self, proposal_id: str, price: float) -> dict:
@@ -366,7 +352,7 @@ class DerivClient:
     async def buy_now(
         self,
         contract_type: str,
-        barrier: str,
+        barrier: str | None,
         stake: float,
         duration: int,
         duration_unit: str,
@@ -376,22 +362,18 @@ class DerivClient:
         """Buys straight from contract parameters in ONE round trip, with no
         proposal first. `price` is the most we'll pay, so a worse quote is
         rejected instead of filled."""
-        msg = await self._request(
-            {
-                "buy": 1,
-                "price": stake,
-                "parameters": {
-                    "contract_type": contract_type,
-                    "amount": stake,
-                    "basis": "stake",
-                    "currency": currency,
-                    "duration": duration,
-                    "duration_unit": duration_unit,
-                    "underlying_symbol": symbol,
-                    "barrier": barrier,
-                },
-            }
-        )
+        parameters = {
+            "contract_type": contract_type,
+            "amount": stake,
+            "basis": "stake",
+            "currency": currency,
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+        }
+        if barrier is not None:
+            parameters["barrier"] = barrier
+        msg = await self._request({"buy": 1, "price": stake, "parameters": parameters})
         return msg["buy"]
 
     async def wait_for_settlement(self, contract_id: int, timeout: float = 60.0) -> dict:
@@ -502,10 +484,8 @@ class RiskManager:
 # ---------------------------------------------------------------------------
 
 
-def describe_contract(contract_type: str, barrier: str) -> str:
-    if contract_type == "DIGITDIFF":
-        return f"differs from {barrier}"
-    return f"{'over' if contract_type == 'DIGITOVER' else 'under'} {barrier}"
+def describe_contract(contract_type: str, barrier: str | None) -> str:
+    return Contract(contract_type, barrier, 0).label
 
 
 def send_telegram_message(cfg: Config, text: str) -> None:
@@ -523,6 +503,12 @@ def send_telegram_message(cfg: Config, text: str) -> None:
             print(f"Telegram notify failed ({resp.status_code}): {resp.text}")
     except requests.RequestException as e:
         print(f"Telegram notify failed: {e}")
+
+
+async def notify(cfg: Config, text: str) -> None:
+    """Sends a Telegram message without blocking the event loop (a slow
+    Telegram request must not stall tick handling or trade settlement)."""
+    await asyncio.to_thread(send_telegram_message, cfg, text)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +529,7 @@ class TradeLogger:
         "profit",
         "balance_after",
         "contract_id",
+        "rtp",
     ]
 
     def __init__(self, path: Path):
@@ -679,7 +666,7 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 headline = f"✅ Trade won: +{profit:.2f} {cfg.currency}"
             else:
                 headline = f"❌ Trade lost: {profit:.2f} {cfg.currency}"
-            send_telegram_message(
+            await notify(
                 cfg,
                 f"{headline}\n"
                 f"{cfg.symbol}, {trade_desc}, {cfg.account} account\n"
@@ -691,7 +678,7 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
 
         if risk.won:
             print(f"Session done: WON on attempt {risk.trades_done} | net daily_pnl={risk.daily_pnl:+.2f}")
-            send_telegram_message(
+            await notify(
                 cfg,
                 f"🏁 Session over — won on attempt {risk.trades_done} of {cfg.max_attempts}.\n"
                 f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
@@ -701,7 +688,7 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
                 f"Session done WITHOUT a win ({risk.stop_reason}) | "
                 f"net daily_pnl={risk.daily_pnl:+.2f} — today is a net loss despite the cap"
             )
-            send_telegram_message(
+            await notify(
                 cfg,
                 f"🏁 Session over — no win today ({risk.stop_reason}).\n"
                 f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
@@ -718,25 +705,19 @@ async def run_session(cfg: Config, contract_type: str, mode: str, logger: TradeL
 
 
 # ---------------------------------------------------------------------------
-# Always-on digit-trigger loop (the default CLI mode)
+# Always-on quote-quality loop (the default CLI mode)
 # ---------------------------------------------------------------------------
-
-
-def _last_digit(tick: dict) -> str:
-    pip_size = tick.get("pip_size", 2)
-    quote = float(tick["quote"])
-    return f"{quote:.{pip_size}f}"[-1]
 
 
 def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     """Rebuilds today's (UTC) risk state from trade_log.csv. Without this, a
     process restart (Render redeploy, crash, platform maintenance) would
     silently reset trades_done/daily_pnl to zero, letting the bot exceed
-    MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Only counts LIVE rows for
-    this exact account/contract_type/barrier on any of cfg.symbols — DRY_RUN quote rows and
-    unrelated runs (e.g. --once) don't count."""
+    MAX_DAILY_LOSS/MAX_ATTEMPTS across a restart. Counts every LIVE row for
+    this account: the bot picks contracts dynamically, so the budget is shared
+    across all of them. DRY_RUN quote rows don't count."""
     risk = RiskManager(
-        cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=True,
+        cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, stop_on_loss=False,
         profit_target=cfg.daily_profit_target,
     )
     if not log_file.exists():
@@ -746,12 +727,7 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
         for row in csv.DictReader(f):
             if not row.get("timestamp", "").startswith(today):
                 continue
-            if row.get("mode") != "LIVE":
-                continue
-            if row.get("account") != cfg.account or row.get("symbol") not in cfg.symbols:
-                continue
-            expected_contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
-            if row.get("contract_type") != expected_contract_type or row.get("barrier") != cfg.barrier:
+            if row.get("mode") != "LIVE" or row.get("account") != cfg.account:
                 continue
             profit_raw = row.get("profit", "")
             if profit_raw == "":
@@ -760,57 +736,62 @@ def rehydrate_risk(cfg: Config, log_file: Path) -> RiskManager:
     if risk.trades_done:
         print(
             f"Rehydrated today's risk state from {log_file.name}: "
-            f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f} won={risk.won} lost={risk.lost}"
+            f"trades_done={risk.trades_done} daily_pnl={risk.daily_pnl:+.2f}"
         )
     return risk
 
 
-async def refresh_payout_ratios(client: DerivClient, cfg: Config, contract_type: str, ratios: dict) -> None:
-    """Keeps ratios[symbol] = payout / stake fresh in the background so the
-    payout guard never costs a network round trip on the trade path."""
-    while True:
-        for sym in cfg.symbols:
+async def scan_quotes(client: DerivClient, cfg: Config) -> list[Quote]:
+    """Fetches a live quote for every digit contract on every symbol. Sequential
+    with a small pause so the scan stays under Deriv's rate limits; a contract
+    a symbol rejects is simply left out."""
+    quotes: list[Quote] = []
+    for sym in cfg.symbols:
+        for contract in contract_menu():
             try:
                 prop = await client.get_proposal(
-                    contract_type, cfg.barrier, cfg.stake, cfg.duration,
+                    contract.contract_type, contract.barrier, cfg.stake, cfg.duration,
                     cfg.duration_unit, sym, cfg.currency,
                 )
-                ratios[sym] = float(prop["payout"]) / float(prop["ask_price"])
+                quotes.append(Quote(sym, contract, float(prop["ask_price"]), float(prop["payout"])))
             except (DerivApiError, asyncio.TimeoutError):
                 pass
-        await asyncio.sleep(30)
+            await asyncio.sleep(0.1)
+    return quotes
 
 
 async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
-    """Runs forever: stays connected to cfg.symbol's live tick stream and,
-    the instant a tick's last digit equals cfg.digit_trigger, fires a
-    DIGITOVER/DIGITUNDER trade (per cfg.direction, barrier=cfg.barrier) —
-    the trigger digit decides WHEN to trade, cfg.direction/cfg.barrier
-    decide WHAT to bet. Trades through any number of wins, all day, stopping
-    for the day the moment one trade loses (RiskManager runs with
-    stop_on_win=False, stop_on_loss=True here). MAX_ATTEMPTS and
-    MAX_DAILY_LOSS remain as backstops. Once stopped, this keeps watching
-    ticks (so it notices the day roll over) but stops placing trades until
-    then. Reconnects with exponential backoff on any websocket/API error,
-    and tolerates not being logged in yet (missing deriv_tokens.json) by
-    waiting and retrying instead of exiting — useful when this runs as a
-    server background task that starts before /login has been visited.
-    Returns only on cancellation (the caller's job)."""
+    """Runs forever. Digits are independent and uniform, so there is no
+    "right moment" to trade and no digit pattern worth waiting for. What does
+    vary is the house edge in each live quote, so each cycle this:
+
+      1. quotes every digit contract on every symbol,
+      2. computes each one's RTP (true win probability x payout / stake),
+      3. trades the single best quote only if its RTP >= MIN_RTP,
+      4. otherwise waits SCAN_INTERVAL and looks again.
+
+    This minimises the expected cost per trade; it does not make that cost
+    positive, so expect a slow net loss over many trades. MAX_DAILY_LOSS,
+    MAX_ATTEMPTS and DAILY_PROFIT_TARGET bound each UTC day; once stopped it
+    idles until the date rolls over. Reconnects with exponential backoff on any
+    websocket/API error, and tolerates not being logged in yet (missing
+    deriv_tokens.json) by waiting and retrying instead of exiting. Returns only
+    on cancellation (the caller's job)."""
     mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
-    contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
     print(
-        f"=== Deriv digit-trigger bot | {mode} | account={cfg.account} symbols={','.join(cfg.symbols)} "
-        f"trigger_digit={cfg.digit_trigger}x{cfg.digit_trigger_count} trade={contract_type} barrier={cfg.barrier} stake={cfg.stake} ==="
+        f"=== Deriv quote-quality bot | {mode} | account={cfg.account} symbols={','.join(cfg.symbols)} "
+        f"stake={cfg.stake} min_rtp={cfg.min_rtp} ==="
     )
 
     current_day = datetime.now(timezone.utc).date()
     risk = rehydrate_risk(cfg, cfg.log_file)
     capped_notified = False
+    wins = 0
+    traded_probs: list[float] = []
     backoff = 2
 
     while True:
         client = None
-        ratio_task = None
         try:
             tokens = ensure_access_token(load_tokens())
             account_id = pick_account(tokens, cfg.account)
@@ -820,17 +801,6 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
             print(f"Connected to {bal['loginid']} | balance: {bal['balance']} {bal['currency']}")
             backoff = 2  # reset once a connection actually succeeds
 
-            queue: asyncio.Queue = asyncio.Queue()
-            for sym in cfg.symbols:
-                await client.subscribe_ticks(sym, queue)
-            print(
-                f"Watching {', '.join(cfg.symbols)} ticks for {cfg.digit_trigger_count} consecutive "
-                f"last digit(s) == {cfg.digit_trigger} ..."
-            )
-            streaks: dict[str, int] = {}  # per symbol: consecutive ticks ending in the trigger digit
-            payout_ratios: dict[str, float] = {}
-            ratio_task = asyncio.create_task(refresh_payout_ratios(client, cfg, contract_type, payout_ratios))
-
             while True:
                 today = datetime.now(timezone.utc).date()
                 if today != current_day:
@@ -839,80 +809,67 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     risk = rehydrate_risk(cfg, cfg.log_file)
                     capped_notified = False
 
-                msg = await queue.get()
-                if "error" in msg:
-                    raise DerivApiError(msg["error"].get("message", "tick stream error"))
-
-                tick = msg.get("tick")
-                if not tick:
-                    continue
-
-                symbol = tick["symbol"]
-                if _last_digit(tick) != cfg.digit_trigger:
-                    streaks[symbol] = 0
-                    continue
-                streaks[symbol] = streaks.get(symbol, 0) + 1
-                if streaks[symbol] < cfg.digit_trigger_count:
-                    continue
-                # A run fires one trade; the streak must rebuild from scratch for the next.
-                streaks[symbol] = 0
-
                 if not risk.can_trade():
                     if not capped_notified:
-                        print(f"Trigger digit seen but not trading — {risk.stop_reason}. Still watching for tomorrow.")
                         capped_notified = True
+                        print(
+                            f"Trading paused for today ({risk.stop_reason}) | net daily_pnl={risk.daily_pnl:+.2f} "
+                            "— will resume automatically tomorrow."
+                        )
+                        await notify(
+                            cfg,
+                            f"🏁 Trading paused for today — {risk.stop_reason}.\n"
+                            f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
+                        )
+                    await asyncio.sleep(30)
                     continue
 
+                quotes = await scan_quotes(client, cfg)
+                best = best_quote(quotes, cfg.min_rtp)
                 ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                print(f"[{ts}] trigger digit {cfg.digit_trigger} seen {cfg.digit_trigger_count}x in a row on {symbol} @ {tick['quote']}")
+                if best is None:
+                    top = max(quotes, key=lambda q: q.rtp, default=None)
+                    seen = f"best seen {top.rtp:.4f} ({top.contract.label} on {top.symbol})" if top else "no quotes"
+                    print(f"[{ts}] nothing at RTP >= {cfg.min_rtp}: {seen}; rescanning in {cfg.scan_interval:.0f}s")
+                    await asyncio.sleep(cfg.scan_interval)
+                    continue
+
+                c = best.contract
+                print(
+                    f"[{ts}] best quote: {c.label} on {best.symbol} | win_prob={c.win_prob:.2f} "
+                    f"payout={best.payout:.2f} RTP={best.rtp:.4f} "
+                    f"(expected cost {(1 - best.rtp) * best.stake:+.4f} per trade)"
+                )
 
                 if mode == "DRY_RUN":
-                    try:
-                        proposal = await client.get_proposal(
-                            contract_type, cfg.barrier, cfg.stake, cfg.duration,
-                            cfg.duration_unit, symbol, cfg.currency,
-                        )
-                        ask_price = float(proposal["ask_price"])
-                        payout = float(proposal["payout"])
-                    except DerivApiError as e:
-                        print(f"Proposal error: {e}")
-                        continue
-                    print(
-                        f"[DRY_RUN] {contract_type} barrier={cfg.barrier} stake={ask_price:.2f} "
-                        f"payout={payout:.2f} — quote only, no purchase made"
-                    )
                     logger.log(
-                        timestamp=ts, mode=mode, account=cfg.account, symbol=symbol,
-                        contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
+                        timestamp=ts, mode=mode, account=cfg.account, symbol=best.symbol,
+                        contract_type=c.contract_type, barrier=c.barrier or "", stake=best.stake,
+                        payout=best.payout, rtp=f"{best.rtp:.4f}",
                     )
+                    await asyncio.sleep(cfg.scan_interval)
                     continue
-
-                # Guard uses the background-refreshed quote (no round trip on
-                # the hot path); no quote yet means we can't vouch for it, so skip.
-                if cfg.min_payout_ratio:
-                    ratio = payout_ratios.get(symbol)
-                    if ratio is None or ratio < cfg.min_payout_ratio:
-                        shown = "no quote yet" if ratio is None else f"{ratio:.3f}x stake"
-                        print(f"  skipped: payout {shown}, MIN_PAYOUT_RATIO {cfg.min_payout_ratio}")
-                        continue
 
                 print(f"  attempt {risk.trades_done + 1}/{cfg.max_attempts} buying now")
                 try:
                     sent = time.monotonic()
                     bought = await client.buy_now(
-                        contract_type, cfg.barrier, cfg.stake, cfg.duration,
-                        cfg.duration_unit, symbol, cfg.currency,
+                        c.contract_type, c.barrier, cfg.stake, cfg.duration,
+                        cfg.duration_unit, best.symbol, cfg.currency,
                     )
                     print(f"  buy confirmed in {(time.monotonic() - sent) * 1000:.0f} ms")
                     ask_price = float(bought.get("buy_price", cfg.stake))
-                    payout = float(bought.get("payout", 0))
+                    payout = float(bought.get("payout", best.payout))
                     settled = await client.wait_for_settlement(bought["contract_id"])
                 except (DerivApiError, asyncio.TimeoutError) as e:
                     print(f"Trade error: {e}")
+                    await asyncio.sleep(cfg.trade_cooldown)
                     continue
 
                 profit = float(settled.get("profit", 0))
                 risk.record(profit)
+                wins += profit > 0
+                traded_probs.append(c.win_prob)
 
                 try:
                     balance = await client.get_balance()
@@ -921,47 +878,29 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
                     balance_after = ""
 
                 logger.log(
-                    timestamp=ts, mode=mode, account=cfg.account, symbol=symbol,
-                    contract_type=contract_type, barrier=cfg.barrier, stake=ask_price, payout=payout,
-                    profit=profit, balance_after=balance_after, contract_id=bought.get("contract_id"),
+                    timestamp=ts, mode=mode, account=cfg.account, symbol=best.symbol,
+                    contract_type=c.contract_type, barrier=c.barrier or "", stake=ask_price,
+                    payout=payout, profit=profit, balance_after=balance_after,
+                    contract_id=bought.get("contract_id"), rtp=f"{best.rtp:.4f}",
                 )
 
-                result = "WON" if profit > 0 else "LOST"
+                z = win_rate_z(wins, traded_probs)
                 print(
-                    f"  -> {result} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
-                    f"| attempts={risk.trades_done}/{cfg.max_attempts}"
+                    f"  -> {'WON' if profit > 0 else 'LOST'} profit={profit:+.2f} | daily_pnl={risk.daily_pnl:+.2f} "
+                    f"| attempts={risk.trades_done}/{cfg.max_attempts} | win-count z={z:+.1f}"
                 )
-                trade_desc = describe_contract(contract_type, cfg.barrier)
-                headline = (
-                    f"✅ Trade won: +{profit:.2f} {cfg.currency}" if profit > 0
-                    else f"❌ Trade lost: {profit:.2f} {cfg.currency}"
-                )
-                send_telegram_message(
+                if len(traded_probs) >= 30 and abs(z) > 4:
+                    print("  !! realised wins are far from the contracts' true odds — check the feed/contract mapping")
+                await notify(
                     cfg,
-                    f"{headline}\n{symbol}, {trade_desc}, {cfg.account} account\n"
+                    (f"✅ Trade won: +{profit:.2f} {cfg.currency}" if profit > 0
+                     else f"❌ Trade lost: {profit:.2f} {cfg.currency}")
+                    + f"\n{best.symbol}, {describe_contract(c.contract_type, c.barrier)}, "
+                    f"RTP {best.rtp:.3f}, {cfg.account} account\n"
                     f"📊 Attempt {risk.trades_done} of {cfg.max_attempts} today — running total: "
                     f"{risk.daily_pnl:+.2f} {cfg.currency}",
                 )
-
-                if not risk.can_trade() and not capped_notified:
-                    capped_notified = True
-                    print(
-                        f"Trading paused for today ({risk.stop_reason}) | net daily_pnl={risk.daily_pnl:+.2f} "
-                        "— still watching, will resume automatically tomorrow."
-                    )
-                    send_telegram_message(
-                        cfg,
-                        f"🏁 Trading paused for today — {risk.stop_reason}.\n"
-                        f"💰 Net result today: {risk.daily_pnl:+.2f} {cfg.currency}",
-                    )
-
-                # Ticks that queued up while this trade settled are stale; drop
-                # them so an old run on another symbol can't fire a late trade.
-                while not queue.empty():
-                    stale = queue.get_nowait()
-                    if "error" in stale:
-                        raise DerivApiError(stale["error"].get("message", "tick stream error"))
-                streaks.clear()
+                await asyncio.sleep(cfg.trade_cooldown)
 
         except SystemExit as e:
             print(f"Not ready to trade yet ({e}) — retrying in {backoff}s. Visit /login if you haven't yet.")
@@ -972,8 +911,6 @@ async def watch_and_trade(cfg: Config, logger: TradeLogger) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         finally:
-            if ratio_task:
-                ratio_task.cancel()
             if client:
                 await client.close()
 
