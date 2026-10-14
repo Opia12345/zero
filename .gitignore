@@ -10,4 +10,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.claude
+.claudefx/data/
+fx_trade_log.csv

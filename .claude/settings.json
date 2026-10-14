@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"uvicorn server:app\")",
+      "Bash(python3 -m py_compile /Users/apple/Desktop/deriv_bot/bot_script.py /Users/apple/Desktop/deriv_bot/server.py)"
+    ]
+  }
+}
