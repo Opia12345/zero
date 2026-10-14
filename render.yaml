@@ -1,0 +1,42 @@
+# Render Blueprint. A persistent disk needs a paid instance; on the free plan
+# delete the `disk:` block and the two /var/data variables (state is then lost
+# on every restart, see server.py's docstring).
+services:
+  - type: web
+    name: deriv-fx-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /health
+    disk:
+      name: bot-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: TOKENS_FILE
+        value: /var/data/deriv_tokens.json
+      - key: FX_LOG_FILE
+        value: /var/data/fx_trade_log.csv
+      - key: ACCOUNT
+        value: demo
+      - key: LIVE_CONFIRM
+        value: "no"
+      - key: MAX_DAILY_LOSS
+        value: "3"
+      - key: MAX_ATTEMPTS
+        value: "4"
+      - key: FX_SYMBOLS
+        value: frxXAUUSD
+      - key: FX_RISK
+        value: "1.0"
+      - key: DERIV_APP_ID
+        sync: false
+      - key: API_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

@@ -1,116 +1,92 @@
-"""
-FastAPI service for the Deriv digit-trigger bot.
+"""FastAPI wrapper that keeps the forex/gold bot (fx_bot.py) running on Render.
 
-On boot, this starts bot_script.watch_and_trade() as a background task — it
-stays connected and watches ticks for as long as this process is up. Render
-free-tier web services spin down after ~15 min with no inbound HTTP traffic
-(which would kill that background task along with everything else), so keep
-something pinging GET /health every ~10 minutes (e.g. UptimeRobot or
-cron-job.org, configured on their site, not here) to keep the dyno awake.
-/health's response also reports whether the trading loop is running, so you
-can use the same ping to confirm the bot is actually alive, not just the
-web server.
+On boot it starts fx_bot.run_forever() as a background task. Routes:
+    GET /health      liveness + whether the trading loop is running
+    GET /login       one-time Deriv OAuth2 login (see below)
+    GET /dashboard   recent trades from the fx trade log
 
-Note this only prevents *idle* spin-down. Render can still restart the
-process for other reasons (redeploys, crashes, platform maintenance) — if
-that happens mid-day, watch_and_trade rehydrates today's risk counters from
-trade_log.csv on the way back up, so MAX_DAILY_LOSS/MAX_ATTEMPTS still hold
-across the restart. It does NOT survive a redeploy wiping deriv_tokens.json
-(Render's free-tier disk is ephemeral) — you'd need to hit /login again
-after a redeploy, same as before.
+Start command on Render:
+    uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+(--proxy-headers makes the OAuth redirect_uri use https behind Render's proxy.)
 
-This also still exposes POST /run for a single blind OVER/UNDER session
-(bot_script.py's old --once/cron-triggered behavior), if you want that path
-instead of or alongside the always-on loop.
-
-Deploy on Render as a Web Service with:
-    Start command: uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
-(--proxy-headers is required so the OAuth login flow below sees "https",
-not "http", behind Render's proxy — otherwise the redirect_uri it builds
-won't match what's registered with Deriv.)
-
-One-time login (Deriv retired static API tokens for websocket trading; this
-now needs an interactive OAuth2 + PKCE login):
-1. Register an app at https://developers.deriv.com/dashboard/apps with
+One-time login (Deriv retired static API tokens for websocket trading):
+1. Register an app at https://developers.deriv.com/dashboard/apps with the
    redirect URL exactly: https://<your-render-domain>/oauth/callback
-2. Visit https://<your-render-domain>/login?app_id=<that app's ID>&api_key=<API_SECRET>
-   in a browser, log in, approve. It saves deriv_tokens.json on the server;
-   bot_script.py refreshes it automatically after that.
-Known limitation: Render web services have ephemeral disks by default, so a
-redeploy wipes deriv_tokens.json — you'd need to hit /login again after one.
+   (for local use: http://localhost:8000/oauth/callback)
+2. Visit https://<your-render-domain>/login?app_id=<APP_ID>&api_key=<API_SECRET>
+   and approve. It saves the tokens file (TOKENS_FILE); fx_bot refreshes it.
+   Without a persistent disk the file is wiped on every deploy/restart, and
+   you have to log in again. The bot starts, logs the missing login, and
+   retries every few minutes, so logging in after a deploy is enough.
 
-Trigger a session:
-    POST /run?app_id=<id>&stake=<amount>&live_confirm=yes|no
-    (all three are optional — omitted ones fall back to .env)
-
-Protect it: set API_SECRET in the environment. Requests must then send it as
-either header `X-API-Key: <secret>` or query param `?api_key=<secret>`. If
-API_SECRET isn't set, both /run and /login are unauthenticated — fine for
-local testing, not for a deployed app that can place real trades.
+Set API_SECRET so /login and /dashboard are protected. Render's free tier
+sleeps after ~15 minutes without HTTP traffic; ping /health every ~10 minutes
+(UptimeRobot / cron-job.org) or use a paid instance.
 """
 
 import asyncio
 import base64
 import csv
 import hashlib
+import html
 import json
-import os
 import secrets
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Optional
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-import bot_script as bot
-from dashboard import render_dashboard
+import deriv_core as bot
+import fx_bot
 
-# The always-on trading loop, started in `lifespan` below and cancelled on
-# shutdown. None if it never started (e.g. bad/missing .env config) — in
-# that case the rest of the app (like /login) still comes up so you can fix
-# it, and the loop needs a manual redeploy/restart once config is correct.
-_watch_task: Optional[asyncio.Task] = None
-_watch_logger: Optional["bot.TradeLogger"] = None
+_trade_task: Optional[asyncio.Task] = None
+_cfg: Optional[fx_bot.FxConfig] = None
+
+
+async def _supervise(cfg: fx_bot.FxConfig):
+    """Keeps the trading loop alive. A missing login (SystemExit from the
+    token helpers) is retried every 2 minutes so logging in after a deploy
+    is enough, with no redeploy."""
+    while True:
+        try:
+            await fx_bot.run_forever(cfg)
+        except SystemExit as e:
+            print(f"Trading loop waiting: {e}")
+        except Exception as e:  # keep the service up; the next pass retries
+            print(f"Trading loop crashed: {e!r}")
+        await asyncio.sleep(120)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _watch_task, _watch_logger
+    global _trade_task, _cfg
     try:
-        cfg = bot.Config.load()
+        _cfg = fx_bot.FxConfig.load()
+        _trade_task = asyncio.create_task(_supervise(_cfg))
+        print(f"Trading loop started ({'LIVE' if _cfg.live_confirm else 'DRY_RUN'}, {_cfg.account}).")
     except SystemExit as e:
-        print(f"Trading loop NOT started — fix .env and redeploy: {e}")
-        cfg = None
-    if cfg is not None:
-        _watch_logger = bot.TradeLogger(cfg.log_file)
-        _watch_task = asyncio.create_task(bot.watch_and_trade(cfg, _watch_logger))
-        print("Trading loop started on server boot.")
+        print(f"Trading loop NOT started, fix the environment and redeploy: {e}")
     yield
-    if _watch_task:
-        _watch_task.cancel()
+    if _trade_task:
+        _trade_task.cancel()
         try:
-            await _watch_task
+            await _trade_task
         except asyncio.CancelledError:
             pass
-    if _watch_logger:
-        _watch_logger.close()
 
 
-app = FastAPI(title="Deriv Over/Under bot", lifespan=lifespan)
+app = FastAPI(title="Deriv forex/gold bot", lifespan=lifespan)
 
-# state -> {app_id, code_verifier, redirect_uri}, cleared once consumed by
-# /oauth/callback. Fine as an in-memory dict: this app runs as a single
-# worker process, and only one login happens at a time.
+# state -> {app_id, code_verifier, redirect_uri}, consumed by /oauth/callback.
 _pending_logins: dict[str, dict] = {}
 
 
 def _configured_secret() -> Optional[str]:
-    file_env = bot.load_env_file(Path(__file__).with_name(".env"))
-    return os.environ.get("API_SECRET") or file_env.get("API_SECRET") or None
+    return bot.env_get("API_SECRET") or None
 
 
 def _check_api_key(x_api_key: Optional[str], api_key: Optional[str]) -> None:
@@ -125,23 +101,26 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
 @app.get("/health")
 async def health():
-    """Hit this every ~10 min from an external uptime pinger to keep a
-    Render free-tier dyno from spinning down. `trading` reports the
-    background loop's state: "running", "not started" (bad .env config —
-    check the server logs), or "stopped: <error>" (it crashed and won't
-    retry on its own — this shouldn't happen since watch_and_trade retries
-    internally, but would indicate a bug worth reporting)."""
-    trading = "not started"
-    if _watch_task is not None:
-        if not _watch_task.done():
-            trading = "running"
-        elif _watch_task.cancelled():
-            trading = "stopped: cancelled"
-        else:
-            trading = f"stopped: {_watch_task.exception()}"
-    return {"status": "ok", "trading": trading}
+    """Ping this from an uptime monitor. `trading` is "running", or "not
+    started" (bad environment config, see the logs)."""
+    if _trade_task is None:
+        trading = "not started"
+    elif _trade_task.done():
+        trading = f"stopped: {_trade_task.exception()!r}" if not _trade_task.cancelled() else "stopped: cancelled"
+    else:
+        trading = "running"
+    return {
+        "status": "ok",
+        "trading": trading,
+        "mode": None if _cfg is None else ("LIVE" if _cfg.live_confirm else "DRY_RUN"),
+        "logged_in": bot.TOKENS_FILE.exists(),
+    }
 
 
 @app.get("/login")
@@ -238,66 +217,28 @@ async def oauth_callback(
     return HTMLResponse(f"<h1>Logged in.</h1><p>Saved deriv_tokens.json.</p><ul>{rows}</ul>")
 
 
-@app.api_route("/run", methods=["GET", "POST"])
-async def run(
-    app_id: Optional[str] = Query(default=None),
-    stake: Optional[float] = Query(default=None),
-    live_confirm: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None, description="'demo' or 'real' — which Deriv account to trade against"),
-    api_key: Optional[str] = Query(default=None),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-):
-    _check_api_key(x_api_key, api_key)
-
-    overrides = {}
-    if app_id is not None:
-        overrides["DERIV_APP_ID"] = app_id
-    if stake is not None:
-        overrides["STAKE"] = str(stake)
-    if live_confirm is not None:
-        overrides["LIVE_CONFIRM"] = live_confirm
-    if account is not None:
-        overrides["ACCOUNT"] = account
-
-    try:
-        cfg = bot.Config.load(overrides)
-    except SystemExit as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    mode = "LIVE" if cfg.live_confirm else "DRY_RUN"
-    contract_type = "DIGITOVER" if cfg.direction == "OVER" else "DIGITUNDER"
-    logger = bot.TradeLogger(cfg.log_file)
-    try:
-        summary = await bot.run_session(cfg, contract_type, mode, logger)
-    except SystemExit as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        logger.close()
-
-    return JSONResponse(summary)
-
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     api_key: Optional[str] = Query(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
     _check_api_key(x_api_key, api_key)
-
-    file_env = bot.load_env_file(Path(__file__).with_name(".env"))
-    log_name = os.environ.get("LOG_FILE") or file_env.get("LOG_FILE") or "trade_log.csv"
-    log_path = Path(__file__).with_name(log_name)
-
-    rows: list = []
-    if log_path.exists():
-        with log_path.open("r", newline="") as f:
+    rows: list[dict] = []
+    if _cfg is not None and _cfg.log_file.exists():
+        with _cfg.log_file.open(newline="") as f:
             rows = list(csv.DictReader(f))
-
-    accounts: list = []
-    if bot.TOKENS_FILE.exists():
-        try:
-            accounts = json.loads(bot.TOKENS_FILE.read_text()).get("accounts", [])
-        except json.JSONDecodeError:
-            accounts = []
-
-    return HTMLResponse(render_dashboard(rows, accounts))
+    live = [r for r in rows if r["mode"] == "LIVE" and r["profit"] != ""]
+    total = sum(float(r["profit"]) for r in live)
+    wins = sum(1 for r in live if float(r["profit"]) > 0)
+    head = "".join(f"<th>{h}</th>" for h in fx_bot.LOG_FIELDS)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(r.get(h, ''))}</td>" for h in fx_bot.LOG_FIELDS) + "</tr>"
+        for r in reversed(rows[-100:])
+    )
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>FX bot</title><style>body{font:14px system-ui;margin:16px}table{border-collapse:collapse}"
+        "td,th{border:1px solid #8884;padding:3px 8px;white-space:nowrap}div{overflow-x:auto}</style>"
+        f"<h1>FX bot</h1><p>{len(live)} settled trades, {wins} wins, P&amp;L {total:+.2f}</p>"
+        f"<div><table><tr>{head}</tr>{body}</table></div>"
+    )
