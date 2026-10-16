@@ -39,11 +39,9 @@ import pandas as pd
 from websockets.exceptions import ConnectionClosed
 
 import deriv_core as b
-from fx.backtest import MAX_HOLD
 from fx.data import _page
-from fx.strategies import asian_breakout
+from fx.strategies import ONCE_PER_DAY, STRATEGIES
 
-GRANULARITY = 900
 LOG_FIELDS = ["timestamp", "mode", "account", "symbol", "side", "multiplier", "stake", "stop_loss",
               "take_profit", "commission", "entry_price", "profit", "contract_id"]
 
@@ -60,6 +58,10 @@ class FxConfig:
     risk: float
     rr: float
     max_stake: float
+    strategy: str
+    granularity: int
+    max_hold: int  # bars before a position is closed at market
+    max_commission: float  # skip a trade if Deriv's commission exceeds this fraction of FX_RISK
     log_file: Path
     telegram_bot_token: str
     telegram_chat_id: str
@@ -86,10 +88,16 @@ class FxConfig:
             risk=float(b.env_get("FX_RISK", "1.0")),
             rr=float(b.env_get("FX_RR", "1.5")),
             max_stake=float(b.env_get("FX_MAX_STAKE", "20")),
+            strategy=b.env_get("FX_STRATEGY", "asian_breakout"),
+            granularity=int(b.env_get("FX_GRANULARITY", "900")),
+            max_hold=int(b.env_get("FX_MAX_HOLD", "96")),
+            max_commission=float(b.env_get("FX_MAX_COMMISSION", "0.3")),
             log_file=Path(b.env_get("FX_LOG_FILE", "fx_trade_log.csv")),
             telegram_bot_token=b.env_get("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=b.env_get("TELEGRAM_CHAT_ID"),
         )
+        if cfg.strategy not in STRATEGIES:
+            raise SystemExit(f"FX_STRATEGY must be one of {list(STRATEGIES)}")
         if cfg.risk <= 0 or cfg.rr <= 0 or cfg.max_daily_loss <= 0:
             raise SystemExit("FX_RISK, FX_RR and MAX_DAILY_LOSS must be positive")
         return cfg
@@ -171,24 +179,32 @@ def todays_history(path: Path) -> tuple[set, float, int]:
     return traded, pnl, n
 
 
-async def latest_candles(symbol: str) -> pd.DataFrame:
-    """Closed M15 candles for the last ~2 days (enough for the Asian range + ATR)."""
-    candles = await _page(symbol, GRANULARITY, "latest")
+async def latest_candles(symbol: str, granularity: int) -> pd.DataFrame:
+    """Closed candles from the latest page (1000 bars: plenty for the EMAs/ATR/Asian range)."""
+    candles = await _page(symbol, granularity, "latest")
     df = pd.DataFrame(candles)[["epoch", "open", "high", "low", "close"]]
-    df = df[df.epoch + GRANULARITY <= time.time()].reset_index(drop=True)  # drop the forming bar
+    df = df[df.epoch + granularity <= time.time()].reset_index(drop=True)  # drop the forming bar
     df["time"] = pd.to_datetime(df.epoch, unit="s", utc=True)
     return df
 
 
-async def manage_position(client, cfg, log, risk, symbol, side, bought, plan, commission, entry_ts):
+async def manage_position(client, cfg, log, risk, open_syms, symbol, side, bought, plan, commission, entry_ts):
+    cid = bought["contract_id"]
+    try:
+        await _manage(client, cfg, log, risk, symbol, side, bought, plan, commission, entry_ts)
+    finally:
+        open_syms.discard(symbol)
+
+
+async def _manage(client, cfg, log, risk, symbol, side, bought, plan, commission, entry_ts):
     cid = bought["contract_id"]
     try:
         try:
-            poc = await client.wait_for_settlement(cid, timeout=MAX_HOLD * GRANULARITY)
+            poc = await client.wait_for_settlement(cid, timeout=cfg.max_hold * cfg.granularity)
         except b.DerivApiError as e:
             if "Timed out" not in str(e):
                 raise
-            print(f"{symbol}: {MAX_HOLD}-bar time limit hit, closing at market")
+            print(f"{symbol}: {cfg.max_hold}-bar time limit hit, closing at market")
             await client.close_now(cid)
             poc = await client.wait_for_settlement(cid, timeout=60)
         profit = float(poc.get("profit", 0))
@@ -221,37 +237,48 @@ async def run(cfg: FxConfig):
 
     mults = {s: await client.multiplier_range(s) for s in symbols}
     traded, pnl, n = todays_history(log_path)
+    once_per_day = cfg.strategy in ONCE_PER_DAY
+    strategy = STRATEGIES[cfg.strategy]
+    gran = cfg.granularity
     day = datetime.now(timezone.utc).date()
     risk = b.RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, daily_pnl=pnl, trades_done=n)
     tasks: set[asyncio.Task] = set()
-    quoted_today: set[str] = set()
+    open_syms: set[str] = set()  # symbols with a live position: one at a time per symbol
+    quoted: set[tuple[str, int]] = set()  # DRY_RUN: (symbol, bar epoch) already quoted
+    print(f"Strategy {cfg.strategy} on M{gran // 60 or gran}s bars, time stop {cfg.max_hold} bars, "
+          f"max {cfg.max_attempts} trades/day, max daily loss {cfg.max_daily_loss}")
 
     try:
         while True:
-            # wake a few seconds after each M15 bar closes
-            await asyncio.sleep(GRANULARITY - (time.time() % GRANULARITY) + 5)
+            # wake a few seconds after each bar closes
+            await asyncio.sleep(gran - (time.time() % gran) + 3)
             if datetime.now(timezone.utc).date() != day:
                 day = datetime.now(timezone.utc).date()
-                traded, quoted_today = set(), set()
+                traded, quoted = set(), set()
                 risk = b.RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False)
             if not risk.can_trade():
                 print(f"Idle: {risk.stop_reason}")
                 continue
             for sym in symbols:
-                if sym in traded or sym in quoted_today:
+                if sym in open_syms or (once_per_day and sym in traded):
                     continue
                 try:
-                    df = await latest_candles(sym)
+                    df = await latest_candles(sym, gran)
                 except RuntimeError as e:
                     print(f"{sym}: {e}")
                     continue
-                sigs = [s for s in asian_breakout(df, rr=rr) if s.idx == len(df) - 1]
+                last = int(df.epoch.iloc[-1])
+                sigs = [s for s in strategy(df, rr=rr) if s.idx == len(df) - 1]
+                tag = f"{datetime.now(timezone.utc):%H:%M:%S} {sym} close {df.close.iloc[-1]}"
                 if not sigs:
+                    print(f"[{tag}] no signal | day pnl {risk.daily_pnl:+.2f}, {risk.trades_done} trades")
+                    continue
+                if (sym, last) in quoted:
                     continue
                 sig, price = sigs[0], float(df.close.iloc[-1])
                 plan = plan_trade(price, sig.sl_dist, risk_usd, rr, mults[sym], max_stake)
                 if plan is None:
-                    print(f"{sym}: {sig.side} signal skipped, stop {sig.sl_dist:.4f} fits no multiplier")
+                    print(f"[{tag}] {sig.side} signal skipped, stop {sig.sl_dist:.4f} fits no multiplier")
                     continue
                 mult, stake, sl, tp = plan
                 args = (sig.side, stake, mult, sym, cfg.currency, sl, tp)
@@ -260,14 +287,19 @@ async def run(cfg: FxConfig):
                 commission = quote.get("commission", "")
                 print(f"[{ts}] {sym} {sig.side} x{mult} stake {stake} SL ${sl} TP ${tp} | "
                       f"ask {quote.get('ask_price')} commission {commission}")
+                if commission != "" and float(commission) > cfg.max_commission * risk_usd:
+                    print(f"  skipped: commission {commission} > {cfg.max_commission:.0%} of the ${risk_usd} risk")
+                    quoted.add((sym, last))
+                    continue
                 if not live:
-                    quoted_today.add(sym)
+                    quoted.add((sym, last))
                     log.log(timestamp=ts, mode="DRY_RUN", account=cfg.account, symbol=sym, side=sig.side,
                             multiplier=mult, stake=stake, stop_loss=sl, take_profit=tp, commission=commission)
                     continue
                 bought = await client.open(*args)
                 traded.add(sym)
-                t = asyncio.create_task(manage_position(client, cfg, log, risk, sym, sig.side, bought,
+                open_syms.add(sym)
+                t = asyncio.create_task(manage_position(client, cfg, log, risk, open_syms, sym, sig.side, bought,
                                                         (mult, stake, sl, tp), commission, ts))
                 tasks.add(t)
                 t.add_done_callback(tasks.discard)
