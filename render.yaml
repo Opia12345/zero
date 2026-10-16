@@ -23,15 +23,25 @@ services:
       - key: ACCOUNT
         value: demo
       - key: LIVE_CONFIRM
-        value: "no"
+        value: "yes"
       - key: MAX_DAILY_LOSS
-        value: "3"
+        value: "5"
       - key: MAX_ATTEMPTS
-        value: "4"
+        value: "40"
       - key: FX_SYMBOLS
         value: frxXAUUSD
       - key: FX_RISK
         value: "1.0"
+      - key: FX_RR
+        value: "0.8"
+      - key: FX_STRATEGY
+        value: scalp_pullback
+      - key: FX_GRANULARITY
+        value: "60"
+      - key: FX_MAX_HOLD
+        value: "20"
+      - key: FX_MAX_COMMISSION
+        value: "0.3"
       - key: DERIV_APP_ID
         sync: false
       - key: API_SECRET
