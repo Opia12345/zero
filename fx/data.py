@@ -14,7 +14,7 @@ CACHE_DIR = Path(__file__).with_name("data")
 COLUMNS = ["epoch", "open", "high", "low", "close"]
 
 
-async def _page(symbol: str, granularity: int, end, tries: int = 5) -> list[dict]:
+async def _page(symbol: str, granularity: int, end, tries: int = 10) -> list[dict]:
     """One page of candles on a fresh connection; the public socket sometimes
     stalls on a request, so time out and retry rather than hang."""
     last: Exception | None = None

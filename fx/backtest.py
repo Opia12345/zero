@@ -24,7 +24,7 @@ from .strategies import STRATEGIES, Signal
 MAX_HOLD = 96  # bars (24h on M15)
 
 
-def simulate(df: pd.DataFrame, signals: list[Signal], cost: float) -> pd.DataFrame:
+def simulate(df: pd.DataFrame, signals: list[Signal], cost: float, max_hold: int = MAX_HOLD) -> pd.DataFrame:
     trades, free_from = [], 0
     for s in signals:
         e = s.idx + 1
@@ -34,8 +34,8 @@ def simulate(df: pd.DataFrame, signals: list[Signal], cost: float) -> pd.DataFra
         up = s.side == "UP"
         sl = entry - s.sl_dist if up else entry + s.sl_dist
         tp = entry + s.tp_dist if up else entry - s.tp_dist
-        exit_px, j = df.close[min(e + MAX_HOLD, len(df) - 1)], min(e + MAX_HOLD, len(df) - 1)
-        for k in range(e, min(e + MAX_HOLD, len(df) - 1) + 1):
+        exit_px, j = df.close[min(e + max_hold, len(df) - 1)], min(e + max_hold, len(df) - 1)
+        for k in range(e, min(e + max_hold, len(df) - 1) + 1):
             hit_sl = df.low[k] <= sl if up else df.high[k] >= sl
             hit_tp = df.high[k] >= tp if up else df.low[k] <= tp
             if hit_sl:
@@ -66,6 +66,9 @@ def main():
     ap.add_argument("--granularity", type=int, default=900)
     ap.add_argument("--days", type=int, default=180)
     ap.add_argument("--cost", type=float, default=0.0002, help="fee as fraction of notional")
+    ap.add_argument("--strategies", default=",".join(STRATEGIES))
+    ap.add_argument("--max-hold", type=int, default=MAX_HOLD)
+    ap.add_argument("--rr", type=float, default=None)
     ap.add_argument("--refresh", action="store_true")
     args = ap.parse_args()
 
@@ -73,10 +76,11 @@ def main():
         df = load_candles(sym, args.granularity, args.days, args.refresh)
         mid = len(df) // 2
         print(f"\n{sym}: {len(df)} bars {df.time.iloc[0]:%Y-%m-%d} -> {df.time.iloc[-1]:%Y-%m-%d}")
-        for name, fn in STRATEGIES.items():
-            sigs = fn(df)
+        for name in args.strategies.split(","):
+            fn = STRATEGIES[name]
+            sigs = fn(df) if args.rr is None else fn(df, rr=args.rr)
             for label, c in (("zero cost", 0.0), (f"cost {args.cost}", args.cost)):
-                t = simulate(df, sigs, c)
+                t = simulate(df, sigs, c, args.max_hold)
                 h1, h2 = t[t.time < df.time[mid]], t[t.time >= df.time[mid]]
                 print(f"  {name:15s} {label:12s} ALL  {summarize(t)}")
                 print(f"  {'':15s} {'':12s} 1st½ {summarize(h1)}\n  {'':15s} {'':12s} 2nd½ {summarize(h2)}")

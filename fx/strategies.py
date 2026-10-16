@@ -76,4 +76,35 @@ def asian_breakout(df, asia_end=7, trade_end=12, rr=1.5, min_atr=1.5, max_atr=8.
     return out
 
 
-STRATEGIES = {"trend_pullback": trend_pullback, "asian_breakout": asian_breakout}
+def rsi(close: pd.Series, n: int) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def scalp_pullback(df, rr=0.8, ema_trend=100, rsi_n=3, lo=25, hi=75, sl_atr=1.5, start_hour=0, end_hour=24):
+    """Frequent short-horizon scalp: buy a sharp RSI dip inside an up-trend
+    (close above the trend EMA), sell a sharp spike inside a down-trend. Small
+    target (rr < 1 x the stop) so most trades close for a little profit; meant
+    for M1 bars with a time stop."""
+    et = df.close.ewm(span=ema_trend, adjust=False).mean().to_numpy()
+    r = rsi(df.close, rsi_n).to_numpy()
+    a = atr(df).to_numpy()
+    c = df.close.to_numpy()
+    hour = df.time.dt.hour.to_numpy()
+    out = []
+    for i in range(ema_trend, len(df)):
+        if not (start_hour <= hour[i] < end_hour) or np.isnan(a[i]) or np.isnan(r[i]):
+            continue
+        sl = sl_atr * a[i]
+        if r[i] < lo and c[i] > et[i]:
+            out.append(Signal(i, "UP", sl, sl * rr))
+        elif r[i] > hi and c[i] < et[i]:
+            out.append(Signal(i, "DOWN", sl, sl * rr))
+    return out
+
+
+# once_per_day: the strategy fires a single setup a day, so the bot must not re-enter.
+STRATEGIES = {"trend_pullback": trend_pullback, "asian_breakout": asian_breakout, "scalp_pullback": scalp_pullback}
+ONCE_PER_DAY = {"asian_breakout"}
