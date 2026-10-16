@@ -244,7 +244,10 @@ async def run(cfg: FxConfig):
     risk = b.RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False, daily_pnl=pnl, trades_done=n)
     tasks: set[asyncio.Task] = set()
     open_syms: set[str] = set()  # symbols with a live position: one at a time per symbol
+    stop_notified = None  # UTC date the "stopped for today" message was sent
     quoted: set[tuple[str, int]] = set()  # DRY_RUN: (symbol, bar epoch) already quoted
+    await b.notify(cfg, f"🤖 Bot online ({mode}, {cfg.account}) {bal['balance']} {bal['currency']} | "
+                        f"{cfg.strategy} on {symbols}")
     print(f"Strategy {cfg.strategy} on M{gran // 60 or gran}s bars, time stop {cfg.max_hold} bars, "
           f"max {cfg.max_attempts} trades/day, max daily loss {cfg.max_daily_loss}")
 
@@ -258,6 +261,9 @@ async def run(cfg: FxConfig):
                 risk = b.RiskManager(cfg.max_daily_loss, cfg.max_attempts, stop_on_win=False)
             if not risk.can_trade():
                 print(f"Idle: {risk.stop_reason}")
+                if stop_notified != day:
+                    stop_notified = day
+                    await b.notify(cfg, f"⏸ Stopped for today: {risk.stop_reason}. Day total {risk.daily_pnl:+.2f}")
                 continue
             for sym in symbols:
                 if sym in open_syms or (once_per_day and sym in traded):
